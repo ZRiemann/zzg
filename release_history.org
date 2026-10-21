@@ -1,0 +1,22 @@
+#+TITLE: zzg release history
+#+STARTUP: indent
+
+[[file:readme.org][Project]] | [[file:doc/zh-CN/release_history.org][中文]]
+
+* Releases
+
+** v0.1.0 - 2026-10-21T12:44:20Z
+:PROPERTIES:
+:CUSTOM_ID: v0.1.0
+:END:
+
+- Establish shared Zig components under the public =z= namespace, with optional
+  logging and a component-only facade sharing one runtime.
+- Add pure Zig zpp-compatible configuration, text/JSONL output, local timezone
+  conversion, rotating files, important routing and bounded async lifecycle.
+- Add native engineering, Forge Zig support, focused correctness tests,
+  independent consumption, explicit benchmarks and bilingual usage documentation.
+- Baseline is Zig 0.17.0, Linux x86_64, with no libc or third-party logger.
+  See [[file:doc/en/verification.org][actual verification]] for results and limits.
+- Record the initial v0.1.0 source delivery; no additional tests or builds were
+  run for this commit, and no push or release was performed.

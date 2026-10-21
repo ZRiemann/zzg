@@ -1,0 +1,104 @@
+#+TITLE: Phase 1 — Zig foundations and logging
+#+STARTUP: indent
+
+[[file:readme.org][Index]] | [[file:../zh-CN/phase1_logging.org][中文]]
+
+* Goal and scope
+
+Deliver the ZetaX =z= namespace, native Zig/Forge engineering boundary, and a
+pure Zig logging component compatible with current zpp configuration and the
+zust pattern subset. Baseline: exact Zig 0.17.0, Linux x86_64, no libc or third-party
+logging backend. Overall status: accepted awaiting versioned delivery.
+Actual versioned delivery remains unset until an authorized version commit.
+
+Non-goals: other foundational components, full spdlog pattern grammar, runtime
+backend plugins, multiprocess file sharing, hot configuration/timezone reload,
+leap seconds, other-platform runtime acceptance or a production-maturity claim.
+
+* Architecture and ownership
+
+Dependency direction is =z facade -> log runtime -> config/time/format/output=.
+Types form the shared value contract; infrastructure modules do not depend on
+the facade or application policy. General and independent facades reuse the
+same module object. Compile-time level selection and type-directed JSON field
+loading use Zig facilities; no extra forwarding or dynamic sink registry exists.
+
+The application owns allocator, Io, environment and producer shutdown. The
+runtime owns immutable configuration/timezone snapshots, compiled patterns,
+file buffers, queue and worker/flusher. One successful singleton init is allowed;
+failures publish nothing. Shutdown closes admission, waits for references,
+drains and joins before releasing memory. A small static admission gate and
+static futex reference count keep lifetime coordination independent of runtime
+allocation. A static atomic mask on an independent cache line is derived from
+the shared routing function and updated by control operations under the gate.
+It only rejects calls early; it neither publishes Runtime nor replaces lifetime
+references. Admitted calls recheck routing. Level updates serialize with close
+and cannot republish enabled bits after shutdown. State transitions are
+fresh -> initializing -> ready -> closing ->
+closed; failed init returns to fresh. Formatter reentrant shutdown/flush is unsupported.
+
+Hot-path boundaries: filtered calls do not format or allocate; short payloads
+use stack storage and inline queue slots; output render/file buffers are reused.
+Async queues discard incoming data when full and count capacity drops separately.
+Flush barriers remain reliable. Long payloads allocate explicitly.
+A single async worker establishes accepted order; independent output failures
+are observable without suppressing healthy destinations.
+
+Forge owns the shared Zig adapter, toolchain validation and safe profile cleanup.
+zzg owns native build steps, modules, tests, samples and public configuration.
+Existing zpp/zust sources are read-only compatibility references. Native tests,
+fixed clocks/records, deterministic timezone fixtures and isolated process
+scenarios provide seams without a public plugin system.
+
+* Stage 1.1 — engineering and namespace
+
+- Owner: zzg, with prerequisite support in zeta_forge.
+- Deliverables: optional general =z= facade, independent =z.log= facade,
+  Zig package metadata, native checks/consumers, thin launcher and Forge adapter.
+- Acceptance: exact version checks, read-only CLI/dry-run, profile isolation,
+  run without implicit build, external consumer and one shared runtime.
+- Evidence: [[file:verification.org][validation record]]. Status: accepted awaiting versioned delivery;
+  actual delivery version unset; intended initial zzg version 0.1.0.
+
+* Stage 1.2 — configuration, time and formatting
+
+- Owner: zzg; prerequisite Stage 1.1.
+- Deliverables: strict zpp JSON mapping, owned loaded config, path expansion,
+  compiled zust pattern subset, JSONL tags/escaping, TZif and POSIX DST rules.
+- Acceptance: zpp/zust fixtures, invalid fields/overflow, all supported flags,
+  fixed metadata, calendar/DST/2038+ and malformed/truncated timezone fixtures,
+  allocation-failure cleanup.
+- Evidence: [[file:verification.org][validation record]]. Status: accepted awaiting versioned delivery;
+  actual delivery version unset.
+
+* Stage 1.3 — synchronous output and routing
+
+- Owner: zzg; prerequisite Stage 1.2.
+- Deliverables: console and buffered rotating files, important channel,
+  ordinary/runtime filter, explicit flush and visible errors.
+- Acceptance: correct destination counts, no duplicate important writes,
+  thresholds, full oversized records, startup/size rotation, healthy sink
+  continuity after another sink fails, no formatting under rejected level.
+- Evidence: [[file:verification.org][validation record]]. Status: accepted awaiting versioned delivery;
+  actual delivery version unset.
+
+* Stage 1.4 — asynchronous lifecycle and integration
+
+- Owner: zzg; prerequisite Stage 1.3.
+- Deliverables: bounded queue, single worker, periodic flush, completion barrier,
+  idempotent concurrent shutdown, caller metadata and owned handoff, benchmarks.
+- Acceptance: multi-producer capacity-2 queue, record uniqueness/completeness,
+  long message ownership, >64 short thread IDs, caller source, in-flight
+  formatter during shutdown, Debug/ReleaseFast and static cutoff tests,
+  no libc ELF dependency, reproducible allocation/latency/throughput reports.
+- Evidence: [[file:verification.org][validation record]]. Status: accepted awaiting versioned delivery;
+  actual delivery version unset.
+
+* Overall acceptance and remaining boundaries
+
+Overall acceptance requires the integrated shared suite and example, not just
+individual Stage checklists. Version 0.1.0 metadata is prepared, not a released
+commit. zeta_forge's adapter acceptance does not imply a Forge version bump or
+release. No commit/push, full workspace build, long soak, sanitizer or other
+platform acceptance is implied. Subsequent optimization must preserve these
+contracts and compare repeatable benchmarks before increasing complexity.

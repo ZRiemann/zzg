@@ -1,0 +1,15 @@
+{
+  "server": {
+    "spd": {
+      "async": true,
+      "console": true,
+      "rotate_on_open": true,
+      "name": "${ZETAX_ROOT}/logs/zpp/server.log",
+      "max_size": 32,
+      "rotats": 3,
+      "queue_size": 8192,
+      "flush_interval_sec": 2,
+      "pattern": "%d %H:%M:%S.%f %t %^%L%$: %v\t%g:%#"
+    }
+  }
+}

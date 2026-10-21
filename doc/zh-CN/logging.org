@@ -1,0 +1,173 @@
+#+TITLE: z.log 接口、配置与运行约定
+#+STARTUP: indent
+
+[[file:readme.org][目录]] | [[file:../en/logging.org][English]]
+
+* 接口与所有权
+
+通用模块 =z= 通过 =.log = true= 启用日志；独立组件模块 =zzg-log= 也以
+=z= 导入，公共接口统一为 =z.log=。两种入口直接导出同一个实现模块，
+共享一个进程级运行时，不增加转发层。公共类型为 =Config=、
+=ImportantConfig=、=Level=、=SinkFormat=、=Diagnostic=、=LoadedConfig=、
+=LogGuard= 和 =Stats=；队列、pattern 指令、时区和文件输出属于内部实现。
+
+=init(allocator, io, environment, config)= 复制所需字符串，解析启用的路径，
+快照本地时区。allocator 和 Io 必须支持并发，并存活至全部日志及关闭调用
+结束。环境 map 仅在初始化借用，不会修改；原配置可在初始化后释放。
+每进程仅允许一次成功初始化，关闭后不可重建；失败初始化可重试。
+
+=fromSpdJson(allocator, json, &diagnostic)= 解析独立 spd 对象；
+=fromZppFile(allocator, io, path, section, &diagnostic)= 选择
+=<section>.spd=，service 默认取 section 名称。二者返回拥有内存的
+=LoadedConfig=，通过 =value= 取配置，并须调用 =deinit()=。
+=Diagnostic.path()= 和 =reason= 提供字段错误；文件读取失败保留原生 I/O
+错误。组件只负责日志配置，不接管应用其他配置。
+
+#+begin_src zig
+var diagnostic: z.log.Diagnostic = .{};
+var loaded = try z.log.fromZppFile(init.gpa, init.io, "doc/server.json", "example", &diagnostic);
+defer loaded.deinit();
+const guard = try z.log.init(init.gpa, init.io, init.environ_map, loaded.value);
+defer guard.deinit();
+z.log.info(@src(), "[service:startup] count={d}", .{42});
+z.log.important(@src(), "[service:ready] ready", .{});
+try guard.shutdown();
+#+end_src
+
+* 配置兼容
+
+| 字段 | 默认值 | 含义 |
+|------+--------+------|
+| async | false | 有界队列和单输出 worker |
+| console | true | stdout，终端条件满足时着色 |
+| name | server.log | 普通日志文件 |
+| max_size | 32 | 文件大小阈值，MiB |
+| rotats | 3 | 备份数，不含当前文件 |
+| rotate_on_open | true | 初始化时轮转已有非空文件 |
+| queue_size | 8192 | 异步操作队列容量 |
+| flush_interval_sec | 2 | 周期刷新间隔，秒 |
+| level | trace | 普通日志最低级别 |
+| flush_level | warn | 达到该级别后刷新输出 |
+| logger_name | zpp | 配置兼容默认名称 |
+| pattern | zpp 默认格式 | 文本格式 |
+| service、node、run_id | 空 | JSONL 元数据 |
+
+程序配置 =Config{}= 默认仅同步控制台。JSON 加载默认还启用普通日志文件；
+=rotating_file= 是程序接口开关，不属于 zpp JSON 字段。程序配置可使用刷新
+间隔 0 禁用周期刷新，JSON 间隔必须为正。
+
+=important= 支持 =enabled=false=、=name=""=、=level=warn=、
+=format=jsonl=、=pattern=""=（继承普通格式）、=max_size=32=、=rotats=3=
+和 =rotate_on_open=true=。JSON 加载启用但未命名时采用
+=<service>.important.jsonl=，service 为空则为 =zpp.important.jsonl=；
+直接程序配置采用 =<logger_name>.important.jsonl=。
+
+级别字符串区分大小写，接受 =trace/debug/info/warn/warning/err/error/critical/off=。
+Off 只用于过滤，不是输出级别。未知字段忽略；已知字段类型错误、非法枚举、
+非正容量、溢出及缺失 section/spd 返回字段错误。这比 zpp 的静默回退严格。
+不隐式读取 =SPDLOG_LEVEL= 等级别环境覆盖。
+
+启用的路径支持开头 =~=、=$VAR=、=${VAR}=，仅展开一次，不继续解析环境值
+中的标记；变量未定义时报错，相对路径基于工作目录。每进程独占当前文件和
+备份文件，路径不得通过链接或备份名称互相别名。初始化拒绝归一化后相同的
+两个当前文件路径，但不锁定文件，也不承诺识别所有文件系统别名。配置验证
+先于打开文件；打开过程失败时，先前创建的目录或文件可能保留。
+
+轮转名称为 =runtime.1.log=、=runtime.2.log= 等。超过阈值的单条记录完整
+写入，下一条触发轮转。每个文件使用 8 KiB 缓冲。部分写入失败后禁用该输出，
+避免重放已写前缀；其他输出继续处理。
+
+* 文本与 JSONL
+
+默认格式（此处转义表示制表符）：
+
+#+begin_example
+%d %H:%M:%S.%f %t %^%L%$: %v\t%g:%#
+#+end_example
+
+pattern 在初始化时编译，支持 =%%=、=%Y %m %d %H %M %S=、=%e=（毫秒）、
+=%f=（微秒）、=%t=（短线程号）、=%P=（进程号）、=%l %L=（完整/简写级别）、
+=%n %v=（logger/消息）、=%s %g %# %!=（文件名、编译器路径、行号、函数名）
+和 =%^ %$=（颜色范围）。其他标记、宽度和对齐修饰符初始化时报错。
+文件不含 ANSI 颜色；控制台需为终端、未设置 NO_COLOR 且 TERM 不是 dumb。
+短线程号在首次符合输出条件时从零分配，线程内缓存，至少两位，不按 64 回绕。
+源码路径和函数名遵循 Zig 编译器元数据，不保证等同 C++ 的命名。
+
+JSONL 包含以下 14 个字段，pid/tid/line 为数字，其余为字符串：
+
+#+begin_example
+ts level logger service node run_id pid tid file line function component action message
+#+end_example
+
+时间为本地 =YYYY-MM-DDTHH:MM:SS.ffffff=，不带时区后缀。JSON warn 为
+=warn=，文本 %l 为 =warning=。消息完整转义，内嵌换行不会拆分 JSONL。
+非法 UTF-8 字节采用 =\u00XX= 表示。前导 =[component:action]= 提取标签，
+component 中额外冒号转为点；无标签或格式错误时标签为空。
+logger 对全部通道使用配置的基础名称，不增加 important 字段或通道后缀，
+与 zust 的跨语言约定对齐。
+
+* 时间、过滤与生命周期
+
+纯 Zig 实现本地时间，不链接 libc。初始化快照 TZif v1-v4 普通时区数据和
+POSIX 未来规则，拒绝闰秒时区。未设置 TZ 时读取 =/etc/localtime=，空 TZ
+表示 UTC。IANA 名称从 =/usr/share/zoneinfo/= 读取，绝对路径选择文件；
+显式 POSIX 字符串支持固定偏移、南北半球夏令时。夏令时字符串必须提供起止
+规则，文件名可带冒号前缀。运行中不热重载，无效或不可用时区使初始化失败。
+
+普通记录先通过运行时 level，再进入普通输出和达到 important 阈值的输出。
+显式 =important()= 严重度为 info：普通输出仍受运行时 level 过滤，启用的
+important 输出绕过两个阈值；每个输出最多一份。=setLevel()= 修改普通阈值；
+=enabled(level)= 和 =importantEnabled()= 同时考虑编译过滤和有效输出。
+二者读取进程静态原子位图，不取得运行时引用；结果是瞬时查询，不保证随后的
+日志调用必然输出。位图含六个普通级别位和一个显式 important 位，未初始化、
+初始化失败及关闭开始后均为零。编译过滤之后，被位图拒绝的调用只读取一次
+原子值并判断位，不进入生命周期 gate、不修改引用计数、不格式化或分配。
+通过预检查的调用仍取得引用并复查实际路由，旧的启用快照不会绕过关闭保护。
+
+位图由同一份路由规则派生；初始化、setLevel 和关闭在 gate 内串行发布更新，
+关闭后的 setLevel 不重新启用日志。与级别切换重叠的调用可按切换前或切换后
+状态处理。位图使用 monotonic 原子操作，仅作过滤；Runtime 发布和回收仍由
+原有 gate/引用协议保护。位图存储按缓存行对齐并填充，避免与高频写入状态共享。
+
+
+调用点 =@src()= 和格式串为 comptime 参数，使用 Zig 原生格式化及参数类型。
+普通函数调用前参数已经求值，昂贵表达式应使用 enabled 条件保护。被过滤的
+调用不格式化、不分配日志堆内存。编译选项为 =-Dlog-level= 和
+=-Dlog-release-level=，默认 trace；未指定 release 选项时继承通用选项。
+选项值为 =trace/debug/info/warn/err/critical/off=；高于 info 时也裁掉
+important。初始化前、关闭后不输出。
+
+异步模式在生产者侧捕获时间、源码、线程号和已格式化消息，转移自有数据。
+单 worker 按有界队列接受顺序处理；并发生产者不承诺墙钟全序。队列满时
+丢弃新记录，important 及所有级别遵守相同策略。槽位内联 1 KiB，已接收的长消息
+分配并在消费后释放，完整保留。
+队列只限制记录数，字节占用还取决于长消息及并发生产者。常见短消息使用
+栈缓冲和已预分配的渲染缓冲，不产生日志堆分配。
+
+=flush()= 等待在其队列位置之前已接受的记录输出并刷新。=shutdown()= 关闭
+新接收，等待在途格式化/提交，停止周期活动，排空、刷新并回收线程；重复和
+并发关闭等待完成。正常使用时应用应先停止并 join 生产者。不要在格式化函数
+内递归调用 flush/shutdown：当前提交持有生命周期引用，可能死锁。日志接口
+不是异步信号安全函数。=deinit()= 用于 defer 尽力清理，显式 shutdown 才
+报告错误。强制退出、abort 和机器故障不保证排空；flush 不承诺 fsync 持久化。
+
+=stats()= 提供 accepted/processed、failures 和队列高水位。processed 表示
+已尝试分流，不代表成功持久化。首次格式化、提交或输出错误直接写 stderr，
+后续错误累计，使 flush/shutdown 返回 =OutputFailure=；deinit 忽略该错误。
+关闭后的最终统计仍可读取，运行中的各原子统计不是事务一致的整体快照。
+
+参见[[file:verification.org][实际验证]]及[[file:phase1_logging.org][架构与阶段归属]]。
+
+
+* 丢弃统计与控制操作
+
+=stats().dropped= 统计被拒绝入队的数据记录，不是调用次数或输出行数；初始化前为零，
+关闭后保留最终值。容量丢弃不算输出故障，不导致 flush/shutdown 失败；真实 I/O、
+分配错误继续原有错误路径。丢弃的长消息缓冲立即回收。容量满时生产者不等待空位、
+不重试、不写 stderr；格式化、分配及互斥锁不承诺严格实时。
+
+现有 worker 首次发现丢弃即直接输出 warn 汇总，包含
+=dropped_delta/dropped_total/queue_size=，之后每五秒最多一次。关闭时 join worker，
+补报剩余增量并最终刷新。汇总绕过数据队列，不计入 accepted/processed。
+显式 flush 屏障保持可靠入队，允许等待空位及完成。important 用于诊断，不能替代
+持久化审计。本次不新增配置项，同步日志行为保持不变。

@@ -1,0 +1,27 @@
+{
+  "example": {
+    "spd": {
+      "async": true,
+      "console": true,
+      "name": "build/logs/zzg/example.runtime.log",
+      "max_size": 32,
+      "rotats": 3,
+      "rotate_on_open": true,
+      "queue_size": 8192,
+      "flush_interval_sec": 2,
+      "level": "trace",
+      "flush_level": "warn",
+      "logger_name": "zzg",
+      "pattern": "%d %H:%M:%S.%f %t %^%L%$: %v\t%g:%#",
+      "important": {
+        "enabled": true,
+        "name": "build/logs/zzg/example.important.jsonl",
+        "level": "warn",
+        "format": "jsonl",
+        "max_size": 16,
+        "rotats": 5,
+        "rotate_on_open": true
+      }
+    }
+  }
+}

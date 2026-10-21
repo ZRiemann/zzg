@@ -1,0 +1,8 @@
+.{
+    .name = .zzg,
+    .fingerprint = 0xa0215113e9061645, // Package identity; preserve across updates.
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "examples", "tests", "LICENSE", "VERSION" },
+}

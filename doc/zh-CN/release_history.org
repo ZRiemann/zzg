@@ -1,0 +1,22 @@
+#+TITLE: zzg 版本历史
+#+STARTUP: indent
+
+[[file:readme.org][目录]] | [[file:../../release_history.org][English]]
+
+* 版本
+
+** v0.1.0 - 2026-10-21T12:44:20Z
+:PROPERTIES:
+:CUSTOM_ID: v0.1.0
+:END:
+
+- 建立顶层 =z= 命名空间的共享 Zig 组件工程，可选日志及独立组件入口共享
+  同一个日志运行时。
+- 新增纯 Zig 的 zpp 配置兼容、文本/JSONL、本地时区转换、轮转文件、
+  important 路由和有界异步生命周期。
+- 新增原生工程、Forge Zig 支持、聚焦正确性测试、独立消费工程、显式基准及
+  双语使用文档。
+- 基线为 Zig 0.17.0、Linux x86_64，不链接 libc、不依赖第三方日志库。
+  结果与边界参见[[file:verification.org][实际验证]]。
+- 记录首次 v0.1.0 源码交付；本次提交未额外运行测试或构建，未执行推送
+  或发布。

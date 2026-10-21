@@ -1,0 +1,200 @@
+#+TITLE: zzg validation evidence
+#+STARTUP: indent
+
+[[file:readme.org][Index]] | [[file:../zh-CN/verification.org][中文]]
+
+* Tested environment and scope
+
+Verified on 2026-10-21 (Asia/Shanghai), Linux x86_64, Zig 0.17.0.
+CPU: 11th Gen Intel(R) Core(TM) i7-11700 @ 2.50GHz. Host: Linux-6.17.0-40-generic-x86_64-with-glibc2.42.
+Evidence covers the uncommitted implementation, not a versioned release.
+No full workspace/library delivery build or long soak was run; the example and
+benchmark were explicitly compiled as focused artifacts.
+
+* Correctness and engineering
+
+- Debug and ReleaseFast: formatting/compiler checks passed; native shared suite
+  completed 18/18 build steps, 14/14 unit tests, eight process scenarios, two
+  local consumer checks and one external package consumer check per profile.
+- Unit tests cover strict configuration/diagnostics, one-pass path expansion,
+  zpp/zust fixture loading, pattern/JSONL formats, invalid UTF-8 escaping,
+  calendar/DST/2038+, TZif v1-v4 and every truncated fixture prefix, and
+  configuration/timezone/runtime allocation-failure cleanup.
+- Scenarios cover sync routing/filtering, four async producers with capacity 2
+  and 2,000 unique records, output failure isolation, startup/oversized rotation,
+  periodic flush, long payload ownership, 70 distinct short thread numbers with
+  caller source metadata, and shutdown during in-flight formatting.
+- Debug compiled warn cutoff and ReleaseFast release-only off cutoff passed
+  =filter-test=. Disabled info/important format strings were not analyzed.
+- The independently built consumer imported both public facades and confirmed
+  they share the same singleton. A no-component consumer also compiled/ran.
+- Forge: eight new Zig adapter tests and 20 existing build-contract tests passed.
+  These include read-only/dry-run, exact version, clean/profile/symlink safety,
+  run without build, dev ordering, inherited environment and CLI failure/interrupt
+  statuses. Actual destructive profile cleanup and interactive interruption were
+  not exercised against the working checkout; contracts use isolated fixtures/mocks.
+- Release logging example passed in console-only and supplied-config modes using
+  the real local timezone. Its important file contained four valid 14-field JSON
+  records at warn/error/critical/info with expected component/action tags.
+- =readelf -l= showed no interpreter and =readelf -d= showed no dynamic section
+  for the release logging example: no libc dynamic dependency. Source build
+  modules explicitly set =link_libc=false=.
+
+The intentional =/dev/full= scenario printed one =NoSpaceLeft= diagnostic and
+returned the expected flush/shutdown failure; the healthy output remained intact.
+This is test evidence, not an unresolved suite failure.
+
+* Bounded ReleaseFast benchmark
+
+Each mode ran in a separate process, with 1,000 warm-up and 20,000 measured calls.
+All accepted records were processed, no output failures occurred, and the logger
+allocator returned to zero live bytes after shutdown. Raw host-local results are
+in =build/zig/release/benchmark-results.json= (regenerable, not source).
+
+| Mode | Drained records/s | p50 ns | p99 ns | Hot allocations | Peak logger bytes | Queue high-water |
+|------+-------------------+--------+--------+-----------------+-------------------+------------------|
+| filtered | 21476349 | 31 | 33 | 0 | 22218 | 0 |
+| sync | 7733623 | 109 | 148 | 0 | 22218 | 0 |
+| async | 2844932 | 223 | 907 | 0 | 95772 | 64 |
+| pressure | 658374 | 4176 | 28152 | 0 | 24348 | 2 |
+| long | 657915 | 842 | 4838 | 40000 | 374560 | 64 |
+
+Filtered records were neither formatted nor accepted. Short-message modes made
+zero measured logger heap allocations. Long mode uses 4,096-byte payloads and
+makes two allocations per measured call (format growth and owned queue copy).
+Pressure uses four producers and capacity 2, intentionally measuring blocking.
+Other async modes use capacity 64. Peak bytes include logger initialization,
+exclude Io/thread internals, and are not process RSS. p50/p99 include clock
+measurement overhead. Drained throughput includes final userspace flushing,
+without fsync or durable storage guarantees. These are single bounded samples,
+not spdlog comparisons or latency SLAs. See [[file:../../BUILD.org][reproduction commands]].
+
+* Acceptance and unverified boundaries
+
+Stages 1.1-1.4 and overall integration are accepted awaiting versioned delivery.
+The initial 0.1.0 version is prepared, with release-history timestamp pending an
+authorized version commit. Forge's new adapter is not separately version-released.
+No commit, push, full build, other-platform acceptance, sanitizer, prolonged
+stress/soak or multi-process shared-file operation was performed. Arbitrary
+filesystem aliases, timezone hot updates and leap-second zones are unsupported.
+
+* Atomic prefilter and producer scaling validation (2026-10-21)
+
+This section covers the final implementation; the initial acceptance results and
+single-round benchmark above remain historical evidence. The same host, exact
+Zig 0.17.0 and ReleaseFast were used. Paired processes inherited affinity 0-7
+(eight physical cores), without system-wide changes. The baseline was compiled
+from the worktree before runtime changes, including the staged implementation.
+Its source snapshot and manifest are under =build/prefilter-comparison/baseline/=
+and =baseline-manifest.json=. Both binaries use identical benchmark source;
+the initial Git HEAD was not substituted for the current implementation.
+
+** Correctness and implementation checks
+
+- Final Debug/ReleaseFast check/test passed. The routing matrix covers all
+  thresholds/output switches and explicit important. Isolated scenarios cover
+  concurrent level writers, writers overlapping close, important-only, no
+  outputs, and disabled queries before init, after init failure and after close.
+- Existing in-flight close, flush barrier, deduplication, output-failure isolation
+  and allocation-failure checks still pass. Debug warn and ReleaseFast
+  release-only off compile-filter checks passed.
+- Each profile passed 16 small benchmark smoke cases (filtered/sync/async/mixed
+  with 1/2/4/8 producers). Eight invalid CLI cases were rejected. Each profile
+  additionally ran level-race and level-shutdown 20 times each: 80 bounded
+  concurrency runs passed in total.
+- ReleaseFast ELF inspection confirms one atomic load/bit test and an early
+  return before gate access. std.atomic.cache_line is 128 on this target; the
+  mask retains 128 bytes and gate begins on the next cache line. A cold-path
+  address escape prevents global scalar replacement from removing padding.
+  Runtime publication/reclamation retain the existing protocol.
+
+** Paired performance results
+
+Seven independent processes per variant/case, alternating baseline/modified and
+reversing pair order each repetition. Every process warms up 1,000 total calls,
+then measures two rounds of 200,000 attempted calls each: batch throughput
+without per-call clocks, then per-call latency. Producers and samples are
+created before warm-up. Timing includes round wake-up/completion notification,
+not thread creation, warm-up or joins. Mixed accepts one info per ten attempts,
+filters nine debug calls, and uses synchronous file output.
+
+Throughput is millions of attempted calls/s; p99 is ns. Cells show the median
+[Q1, Q3] across seven runs, using inclusive interpolated quartiles. Ratio is the
+ratio of throughput medians, not the median of individual paired ratios.
+
+| Mode | Producers | Baseline throughput | Modified throughput | Ratio | Baseline p99 | Modified p99 |
+|------+-----------+---------------------+---------------------+-------+--------------+--------------|
+| filtered | 1 | 46.087 [45.815, 46.782] | 537.506 [527.400, 540.024] | 11.663 | 40 [36.5, 41.5] | 17 [16.0, 17.5] |
+| filtered | 2 | 19.987 [17.954, 21.015] | 1054.952 [1052.225, 1070.135] | 52.782 | 372 [306.0, 504.0] | 16 [16.0, 16.0] |
+| filtered | 4 | 9.942 [8.238, 11.939] | 1969.784 [1946.505, 1983.047] | 198.118 | 3336 [3106.0, 3774.5] | 16 [16.0, 18.5] |
+| filtered | 8 | 3.165 [3.048, 5.396] | 1920.197 [1707.811, 2272.800] | 606.690 | 27527 [23109.5, 30753.5] | 16 [16.0, 19.5] |
+| sync | 1 | 9.613 [9.409, 9.765] | 9.835 [9.689, 9.933] | 1.023 | 142 [138.0, 148.5] | 141 [130.0, 149.0] |
+| sync | 2 | 3.283 [3.156, 3.346] | 3.206 [3.096, 3.228] | 0.977 | 1164 [1047.5, 1275.0] | 1026 [1018.0, 1151.0] |
+| sync | 4 | 3.558 [3.478, 3.615] | 3.578 [3.482, 3.595] | 1.006 | 7594 [7573.5, 7766.5] | 7676 [7558.5, 7746.5] |
+| sync | 8 | 3.145 [3.080, 3.162] | 3.170 [3.169, 3.194] | 1.008 | 14493 [14058.5, 15012.0] | 13861 [13839.5, 14099.0] |
+| async | 1 | 3.130 [2.983, 3.164] | 2.877 [2.845, 3.007] | 0.919 | 938 [907.5, 985.5] | 968 [957.5, 1026.0] |
+| async | 2 | 2.797 [2.786, 2.821] | 2.831 [2.768, 2.854] | 1.012 | 4881 [4817.5, 4980.5] | 4766 [4730.0, 4952.0] |
+| async | 4 | 1.651 [1.632, 1.669] | 1.622 [1.603, 1.635] | 0.982 | 13113 [12916.0, 13441.0] | 12979 [12799.5, 13652.0] |
+| async | 8 | 0.706 [0.690, 0.718] | 0.719 [0.686, 0.721] | 1.018 | 55827 [55052.5, 56639.5] | 56091 [55068.0, 56625.0] |
+| mixed | 1 | 33.125 [32.437, 33.185] | 86.477 [83.878, 87.678] | 2.611 | 120 [118.5, 128.5] | 124 [122.0, 126.5] |
+| mixed | 2 | 14.007 [13.653, 14.287] | 31.912 [31.310, 32.256] | 2.278 | 813 [802.0, 819.5] | 660 [605.0, 711.5] |
+| mixed | 4 | 8.530 [6.975, 8.801] | 34.948 [34.737, 36.162] | 4.097 | 3899 [3700.5, 4003.5] | 1662 [1598.5, 1695.0] |
+| mixed | 8 | 3.074 [2.996, 3.687] | 30.583 [22.097, 30.947] | 9.950 | 24468 [22453.0, 25159.0] | 5460 [5375.0, 5474.5] |
+| pressure | 4 | 0.727 [0.712, 0.730] | 0.717 [0.704, 0.719] | 0.986 | 26073 [25710.0, 26404.0] | 25249 [24984.5, 25889.0] |
+| long | 1 | 0.730 [0.712, 0.735] | 0.690 [0.683, 0.707] | 0.946 | 5085 [4891.5, 5099.0] | 5149 [4895.0, 5458.0] |
+
+Filtered throughput quartiles are clearly separated at 4/8 producers, with gains
+also present in mixed workloads. Enabled sync/async batch throughput changes
+range from -8.1% to +2.3%; the largest p99 increase is 3.2%. No final enabled case
+crosses the 10% review threshold. The single-producer async loss of 8.1% remains
+reported: this is not an across-the-board speedup. Pressure/long throughput
+ratios are 0.986/0.946 respectively.
+
+All per-round count, formatting, output-failure, short-message allocation and
+shutdown-reclamation assertions passed in all 252 final processes. Filtered
+rounds accept/format/allocate zero records. Mixed accepts 40,100 total records;
+other enabled modes accept 401,000. Long makes 400,000 logger heap allocations
+per measured round; all other modes make zero measured logger allocations.
+
+An initial pass exposed removed padding and a sync/2 p99 increase of 10.9%.
+After preserving storage, the complete matrix was rerun; final sync/2 p99 ratio
+is 0.881. Initial data is retained separately as
+=build/prefilter-comparison/initial-scalarized-results.json= and is excluded from
+final aggregates. The two passes alone cannot attribute all latency variation
+to cache layout.
+
+Raw final samples, binary/source hashes, affinity and all distribution summaries
+are in =build/prefilter-comparison/results.json=. The local driver is
+=run_comparison.py= in that directory, alongside =baseline-benchmark= and
+=optimized-benchmark=. These are regenerable verification artifacts, not staged
+source. See [[file:../../BUILD.org][the benchmark guide]] for measurement semantics.
+
+Results compare this z.log before/after only. Fixed %v, short payloads, page-cache
+file writes, the shared formatter atomic counter and barrier overhead affect the
+numbers. Filtered calls/s are not persisted-record throughput; p99 includes
+sampling clocks. No equivalent spdlog comparison, fsync benchmark, full delivery
+build, other-platform run, sanitizer or prolonged stress/soak was performed.
+No version change, commit or push; the original index is preserved.
+
+* Overflow policy verification — 2026-10-21
+
+Earlier sections retain pre-change evidence; this entry supersedes their
+blocking/no-loss assumptions. Zig 0.17.0, Linux x86_64.
+
+- Debug and ReleaseFast: native =zig build test --summary all= passed 22/22
+  steps and 17/17 unit tests, including all twelve process scenarios and the
+  independent consumer. Forge =check= also passed both profiles.
+- A gated worker with capacity one proves four producers finish with 80 dropped
+  records across levels/important routing and 4 KiB payloads, preserves the
+  queued record, reliably processes a flush barrier, and reclaims allocator
+  ownership. Controlled clocks verify report throttling and forced final deltas.
+- Async public scenarios verify accepted + dropped = attempted, processed =
+  accepted after flush, and readable final statistics after concurrent shutdown.
+  Metadata checks avoid overload; actual /dev/full failure remains an error.
+- The benchmark executable was built as a focused ReleaseFast artifact. Bounded
+  pressure/long/sync smokes used 2,000 calls per measured round, plus warm-up;
+  conservation and allocator cleanup passed. Sync dropped zero; pressure short
+  messages had zero hot allocations. These are correctness smokes, not a
+  before/after performance comparison or sustained-load acceptance.
+- No full library delivery build, application/live trading run, sanitizer,
+  long soak, dependency upgrade, commit or deployment was performed.

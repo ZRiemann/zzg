@@ -1,0 +1,48 @@
+#+TITLE: zzg — ZetaX shared Zig components
+#+STARTUP: indent
+
+Shared Zig components and foundational libraries for the ZetaX ecosystem.
+The public namespace is =z=; optional components live under =z.xxx=.
+Zig 0.17.0 and Linux x86_64 are the initial supported toolchain and platform.
+The logging implementation is pure Zig, with no libc or third-party backend.
+
+- [[file:doc/en/readme.org][English documentation]] | [[file:doc/zh-CN/readme.org][中文文档]]
+- [[file:BUILD.org][Build and verification]] | [[file:release_history.org][Release history draft]]
+- [[file:LICENSE][Apache-2.0 license]]
+
+* Consume
+
+Declare a local =zzg= dependency in the application's =build.zig.zon=, then:
+
+#+begin_src zig
+const dep = b.dependency("zzg", .{ .target = target, .optimize = optimize, .log = true });
+exe.root_module.addImport("z", dep.module("z"));
+// Component-only consumers instead add dep.module("zzg-log") under the same "z" name.
+#+end_src
+
+#+begin_src zig
+const std = @import("std");
+const z = @import("z");
+pub fn main(init: std.process.Init) !void {
+    const guard = try z.log.init(init.gpa, init.io, init.environ_map, .{});
+    defer guard.deinit();
+    z.log.info(@src(), "[service:startup] count={d}", .{42});
+    z.log.important(@src(), "[service:ready] ready", .{});
+    try guard.shutdown();
+}
+#+end_src
+
+The general facade enables no components by default. Both facade variants
+re-export one shared module, with no runtime forwarding or second singleton.
+See [[file:doc/en/logging.org][configuration and lifecycle]] before using files or asynchronous output.
+
+* Try the example
+
+#+begin_src sh
+./zbuild.py check --profile debug -j4
+./zbuild.py dev logging --profile debug -j4
+./zbuild.py dev logging --profile debug -j4 -- doc/server.json example
+#+end_src
+
+The supplied JSON writes only to =build/logs/zzg/=; it does not reuse zpp or
+zust log files. Default example execution writes to stdout only.

@@ -1,0 +1,140 @@
+#+TITLE: zzg build and verification
+#+STARTUP: indent
+
+[[file:readme.org][Project]] | [[file:doc/en/verification.org][Actual validation]] | [[file:doc/zh-CN/verification.org][验证记录]]
+
+* Toolchain and ownership
+
+Use exactly Zig =0.17.0=. =build.zig= rejects other versions; Forge's Zig
+adapter checks the same pin. Toolchain installation is a separate environment
+operation: build/check/test never download or replace Zig.
+
+Forge owns the CLI and execution adapter in =common/zeta_forge/zig_engine.py=.
+zzg owns the native graph, source, examples and configuration. Set =ZETAX_ROOT=
+if the sibling Forge checkout cannot be discovered. No Conan graph or external
+Zig packages are required.
+
+* Actions and scope
+
+#+begin_src sh
+./zbuild.py list
+./zbuild.py doctor
+./zbuild.py metadata
+./zbuild.py build --dry-run
+./zbuild.py check --profile debug -j4
+./zbuild.py test --profile debug -j4
+./zbuild.py check --profile release -j4
+./zbuild.py test --profile release -j4
+#+end_src
+
+Release is the default. Debug maps to =Debug=; release maps to =ReleaseFast=.
+Library deliverables =zzg= and =zzg-log= are native Zig modules: build compiles
+representative consumer/test executables without running them. No artificial
+C ABI archive is installed. =check= verifies formatting and compiles tests,
+consumers and the example without execution; =test= runs the shared correctness
+suite, isolated process scenarios and an independent native consumer package.
+Both actions report their shared project scope even when a component is selected.
+
+Formal executable outputs are =build/zig/<profile>/bin/logging= and
+=benchmark=. Native compile caches and the independent consumer's cache belong
+to that same profile. Neither example is part of default library builds.
+
+#+begin_src sh
+./zbuild.py build logging --profile debug -j4
+./zbuild.py run logging --profile debug
+./zbuild.py dev logging --profile debug -j4 -- doc/server.json example
+#+end_src
+
+=run= requires an existing output and never builds. =dev= builds and foreground
+runs once. Arguments after =--= pass unchanged, without being printed by Forge.
+Programs run from the zzg root. The shared process manager handles interruption
+of the foreground process group. Proxy/environment values remain inherited.
+
+=clean= and =rebuild= affect the entire selected native project/profile,
+including sibling outputs and consumer caches; another profile is preserved.
+Do not confuse clean with log rotation: sample logs in =build/logs/= are outside
+profile cleanup. Unsupported =fetch/install= actions fail rather than succeed
+without work. Help/list/metadata/dry-run do not invoke the compiler or mutate files.
+
+* Focused native checks
+
+#+begin_src sh
+zig build filter-test --cache-dir build/zig/debug/filter-cache -Doptimize=Debug -Dlog-level=warn
+zig build filter-test --cache-dir build/zig/release/filter-cache -Doptimize=ReleaseFast -Dlog-level=trace -Dlog-release-level=off
+python3 -m unittest discover -s ../zeta_forge/tests -p test_zig_engine.py -v
+#+end_src
+
+The static-filter check deliberately includes an invalid format string in a
+compiled-out info call. It must compile and accept no record. Normal correctness
+scenarios assume the default trace compile-time cutoff.
+
+* Explicit performance workflow
+
+#+begin_src sh
+./zbuild.py build benchmark --profile release -j4
+./zbuild.py run benchmark -- --run filtered
+./zbuild.py run benchmark -- --run sync
+./zbuild.py run benchmark -- --run async
+./zbuild.py run benchmark -- --run pressure
+./zbuild.py run benchmark -- --run long
+#+end_src
+
+Each process creates all producers before warming up 1,000 total calls. It then
+runs two separate rounds of 20,000 total calls each: batch throughput without
+per-call clocks, followed by per-call latency sampling. =--records N= changes
+the total per round; it must be positive and divisible by the producer count.
+=--threads= accepts 1/2/4/8; defaults are one, or four for pressure. All producers
+warm up on their own threads, wait at a shared start barrier, and remain alive
+across rounds. Thread creation, warm-up and sample allocation are not timed;
+round start/completion wake-up overhead is included. Short runs may be dominated
+by this overhead.
+
+#+begin_src sh
+./zbuild.py run benchmark -- --help
+for threads in 1 2 4 8; do
+    ./zbuild.py run benchmark -- --run filtered --threads "$threads" --records 200000
+    ./zbuild.py run benchmark -- --run sync --threads "$threads" --records 200000
+    ./zbuild.py run benchmark -- --run async --threads "$threads" --records 200000
+    ./zbuild.py run benchmark -- --run mixed --threads "$threads" --records 200000
+done
+#+end_src
+
+Mixed uses synchronous file output at runtime level info, issuing nine filtered
+debug calls then one accepted info per ten calls. Measured counts must be
+multiples of ten per producer. Filtered and short-message rounds assert zero
+logger heap allocations; each round independently checks formatter invocation,
+accepted/processed/dropped deltas and output failures. Pressure defaults to four
+producers and queue capacity 2; other async modes use capacity 64. Long payloads
+contain 4,096 bytes. Shutdown must reclaim all logger allocator bytes.
+
+=batch_calls_per_sec= measures attempted batch caller throughput;
+=batch_drain_per_sec= measures accepted records through the final flush. Existing =submit_per_sec= (attempts), =drain_per_sec= (accepted), =drain_ns=
+and p50/p99 describe the separate latency round and include per-call clocks.
+=hot_allocations= is the latency-round count; =batch_hot_allocations= covers the
+batch round. Final accepted/processed totals include warm-up and both rounds:
+filtered is zero; mixed is one tenth; other modes satisfy accepted + dropped =
+attempted. =processed= equals =accepted= after flushing.
+=records= counts attempted calls per round, not final accepted records.
+=peak_allocated_bytes= includes logger initialization, but excludes process RSS
+and Io/thread internals. Temporary files are process-owned and removed on exit.
+User buffer flushing is not fsync or durable storage throughput. The formatter
+counter is a shared atomic in both compared binaries and adds instrumentation
+cost to accepted calls. Latency sampling is likewise not a logger-only SLA.
+
+For paired comparisons, keep the same benchmark source in an isolated snapshot
+of the current worktree (including staged/untracked implementation) and the
+modified checkout. Build both as ReleaseFast with the exact toolchain, then run
+baseline/modified alternately, reversing pair order each repetition. Use seven
+repetitions, 200,000 calls per measured round, the same CPU affinity/environment
+and output configuration. Report medians, inclusive Q1/Q3, throughput ratios and
+p99; inspect enabled-mode throughput loss or p99 increase exceeding 10% before
+accepting. Do not compare the historical single-round numbers directly with
+this new two-round harness, or claim a comparison against spdlog.
+
+Capacity pressure can now drop new data. Reports include total =dropped= and
+=batch_accepted/batch_dropped/latency_accepted/latency_dropped=. Each round
+checks eligible attempts = accepted + dropped; formatter invocations still count
+eligible attempts, even when admission fails. Overflow summaries are excluded
+from data counts. Do not interpret increased attempted-call throughput as
+increased file-output throughput; compare accepted rates together with drop counts.
+Historical blocking-baseline measurements above retain their historical meaning.

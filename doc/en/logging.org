@@ -1,0 +1,207 @@
+#+TITLE: z.log configuration and operations
+#+STARTUP: indent
+
+[[file:readme.org][Index]] | [[file:../zh-CN/logging.org][中文]]
+
+* API and ownership
+
+Both the general =z= module with =.log = true= and component-only =zzg-log=
+module expose =z.log= when imported as =z=. They share the same implementation
+module and one process-wide runtime. Public types are =Config=,
+=ImportantConfig=, =Level=, =SinkFormat=, =Diagnostic=, =LoadedConfig=,
+=LogGuard= and =Stats=. Internal queues, pattern operations, timezone objects
+and file sinks are not application APIs.
+
+=init(allocator, io, environment, config)= snapshots strings, enabled paths and
+the local timezone. The allocator and Io must be thread-safe and live through
+all logging and shutdown calls. The environment map is borrowed only during
+initialization and is not mutated. Config values may be released after init.
+Exactly one successful initialization is permitted per process, even after
+shutdown; failed initialization is retryable.
+
+=fromSpdJson(allocator, json, &diagnostic)= loads a standalone spd object.
+=fromZppFile(allocator, io, path, section, &diagnostic)= selects =<section>.spd=
+and defaults =service= to that section. Both return =LoadedConfig= with a
+=value= and mandatory =deinit()=. =Diagnostic.path()= and =reason= explain
+configuration errors; file read errors remain native I/O errors. Only logging
+configuration is owned here, not unrelated application sections.
+
+#+begin_src zig
+var diagnostic: z.log.Diagnostic = .{};
+var loaded = try z.log.fromZppFile(init.gpa, init.io, "doc/server.json", "example", &diagnostic);
+defer loaded.deinit();
+const guard = try z.log.init(init.gpa, init.io, init.environ_map, loaded.value);
+defer guard.deinit();
+z.log.info(@src(), "[service:startup] count={d}", .{42});
+z.log.important(@src(), "[service:ready] ready", .{});
+try guard.shutdown();
+#+end_src
+
+* Configuration compatibility
+
+| Field | Default | Meaning |
+|-------+---------+---------|
+| async | false | Bounded queue and one output worker |
+| console | true | stdout, terminal-aware color |
+| name | server.log | Runtime file path |
+| max_size | 32 | File threshold in MiB |
+| rotats | 3 | Backup count excluding active file |
+| rotate_on_open | true | Rotate existing nonempty file on init |
+| queue_size | 8192 | Async operation capacity |
+| flush_interval_sec | 2 | Periodic flush interval |
+| level | trace | Ordinary acceptance threshold |
+| flush_level | warn | Flush outputs at this level and above |
+| logger_name | zpp | Compatibility default |
+| pattern | zpp default | Text pattern |
+| service, node, run_id | empty | JSONL metadata |
+
+Programmatic =Config{}= enables only synchronous console output. Both JSON
+loaders also enable the runtime file by default; =rotating_file= is a
+programmatic switch and not a zpp JSON field. Programmatic flush interval 0
+disables periodic flushing; JSON intervals must be positive.
+
+=important= has =enabled=false=, =name=""=, =level=warn=, =format=jsonl=,
+=pattern=""= (inherits runtime), =max_size=32=, =rotats=3= and
+=rotate_on_open=true=. An enabled unnamed important file uses
+=<service>.important.jsonl= for JSON loading, or =zpp.important.jsonl= when
+service is empty. Direct configuration uses =<logger_name>.important.jsonl=.
+
+Levels accept =trace/debug/info/warn/warning/err/error/critical/off=,
+case-sensitive. Off is a filter setting, not an emitting severity. Unknown JSON
+fields are ignored; wrong types, invalid enums, nonpositive sizes/capacities,
+overflow and missing service/spd objects fail with a field path. This is
+intentionally stricter than zpp's permissive fallback. No implicit
+=SPDLOG_LEVEL= or other level environment override is read.
+
+Enabled paths expand leading =~=, =$VAR= and =${VAR}= once, with undefined
+references reported as errors. Expanded values are not reparsed. Relative paths
+use the process working directory. Each process must exclusively own its active
+files and backups; paths must not alias each other through links or backup names.
+Initialization rejects equal normalized runtime/important active paths, but does
+not lock files or detect every filesystem alias. Validation precedes opening;
+an I/O failure during opening can leave directories/files already created.
+
+Rotation names are =runtime.1.log=, =runtime.2.log=, etc. A record larger than
+the threshold is written whole; the next record rotates it. Buffered writes use
+an 8 KiB buffer per file. Partial write failure disables that sink without
+replaying a written prefix. Other destinations continue processing.
+
+* Text and JSONL
+
+Default pattern (the tab is escaped here):
+
+#+begin_example
+%d %H:%M:%S.%f %t %^%L%$: %v\t%g:%#
+#+end_example
+
+Patterns compile on init. Supported flags are =%%=, =%Y %m %d %H %M %S=,
+=%e= (milliseconds), =%f= (microseconds), =%t= (short thread number), =%P=
+(pid), =%l %L= (long/short level), =%n %v= (logger/message), =%s %g %# %!=
+(source basename, compiler-provided path, line, function), and =%^ %$= (color
+range). Unsupported flags, widths or alignments fail on init. Files contain no
+ANSI escapes; console color requires a terminal, no =NO_COLOR=, and a TERM
+other than =dumb=. Short thread numbers begin at zero on first eligible
+emission, are cached per thread, print at least two digits and do not wrap at 64.
+Source paths and function names follow Zig compiler metadata, not C++ naming.
+
+JSONL contains 14 fields:
+
+#+begin_example
+ts level logger service node run_id pid tid file line function component action message
+#+end_example
+
+Pid/tid/line are numeric. Timestamp is local
+=YYYY-MM-DDTHH:MM:SS.ffffff= without a timezone suffix. JSON warn is =warn=;
+text %l is =warning=. Messages retain embedded newlines through JSON escaping.
+Invalid UTF-8 bytes are represented as =\u00XX= escapes rather than producing
+invalid JSON. A leading =[component:action]= sets tags; additional component
+colons become dots. Untagged/malformed tags yield empty component/action.
+The logger field uses the configured base name for every route; no important
+field or channel suffix is added, matching zust's cross-language convention.
+
+* Time, filtering and lifecycle
+
+Local time is implemented in Zig without libc. Initialization snapshots TZif
+v1-v4 ordinary zone data and POSIX future rules. Leap-second zones are rejected.
+Unset =TZ= reads =/etc/localtime=; empty TZ means UTC. IANA names resolve under
+=/usr/share/zoneinfo/=, absolute paths select files, and explicit POSIX rules
+support fixed offsets and northern/southern DST. DST strings must provide start
+and end rules. Colon-prefixed file names are accepted. Zone data is not reloaded
+at runtime; invalid or unavailable zone data fails initialization.
+
+Ordinary records pass runtime =level= before routing to runtime outputs and to
+the important file at its own threshold. Explicit =important()= has info
+severity: runtime outputs still respect runtime level; enabled important output
+bypasses both thresholds. Each destination receives at most one copy.
+=setLevel()= updates the ordinary threshold. =enabled(level)= and
+=importantEnabled()= include compile-time cutoffs and active destinations.
+Both query a static atomic mask without acquiring a runtime reference. A query
+is an instantaneous observation, not a promise that a later call will emit.
+Six bits describe ordinary severities and one describes explicit important.
+The mask is zero before initialization, after failed initialization and once
+shutdown closes admission. After compile-time filtering, a rejected call uses
+one atomic load and a bit test, without the lifetime gate, reference updates,
+formatting or allocation. Admitted calls still acquire a reference and recheck
+the actual route, so stale positive snapshots cannot bypass shutdown safety.
+
+The mask is derived from the same routing rules. Initialization, setLevel and
+shutdown serialize publication under the gate; setLevel after shutdown cannot
+reactivate logging. Calls overlapping level changes may use either state.
+Mask operations are monotonic: they filter only, while Runtime publication and
+reclamation retain the gate/reference protocol. The padded mask storage occupies
+an independently aligned cache line, separate from frequently written state.
+
+
+Log calls take comptime =@src()= and format strings, with native Zig arguments.
+Zig evaluates arguments before calling functions; use an enabled guard for
+expensive expressions. Filtered calls do no formatting or logger allocation.
+Compiler cutoffs =-Dlog-level= and =-Dlog-release-level= default to trace; the
+release cutoff defaults to the general cutoff. Allowed option values are
+=trace/debug/info/warn/err/critical/off=. Important is also removed above info.
+Calls before init and after close do not emit.
+
+Async mode captures time, source, thread ID and formatted payload on the caller
+and transfers owned data. One worker processes a bounded operation queue in
+acceptance order; concurrent producers have no wall-clock ordering guarantee.
+Full queues discard incoming records at every level, including important.
+Slots inline 1 KiB; larger accepted records allocate, are never
+truncated, and are freed after processing. Record count is bounded; byte usage
+also depends on long payloads and concurrent producers. Standard buffers and
+preallocated render storage avoid logger heap allocation for short messages.
+
+=flush()= is a completion barrier for records already accepted before its queue
+position. =shutdown()= closes admission, waits for in-flight formatting and
+submission, stops periodic activity, drains, flushes and joins workers. Repeated
+or concurrent shutdown waits for completion. Stop/join application producers
+first in normal use. Do not call flush/shutdown recursively from a formatter:
+that submission holds a lifecycle reference and may deadlock. Logging is not
+async-signal-safe. =deinit()= is best-effort defer cleanup; explicit shutdown
+reports errors. Forced exit, abort and machine failure cannot guarantee draining.
+Flush means userspace buffer flush, not fsync durability.
+
+=stats()= reports accepted/processed records, failures and queue high-water
+mark. Processed means attempted routing, not guaranteed persistence. The first
+format/submission/output error is written directly to stderr; errors accumulate
+and make flush/shutdown return =OutputFailure=. =deinit()= discards that error.
+After shutdown final stats remain queryable. Stats during active processing are
+independent atomic snapshots, not a transactionally consistent tuple.
+
+See [[file:verification.org][actual validation]] and [[file:phase1_logging.org][architecture and Stage ownership]].
+
+
+* Overflow statistics and controls
+
+=stats().dropped= counts rejected queue data records, not calls or sink lines.
+It starts at zero and remains readable after shutdown. Capacity drops are not
+output failures and do not fail flush/shutdown; real I/O and allocation failures
+retain their existing error path. Dropped long buffers are reclaimed immediately.
+The producer does not wait for capacity, retry, or write stderr on capacity loss;
+formatting, allocation and mutexes are not a hard real-time guarantee.
+
+The existing worker writes a direct warn summary with
+=dropped_delta/dropped_total/queue_size= on first observed loss, then at most
+once every five seconds. Shutdown joins the worker, reports any remaining delta
+and finally flushes. Summaries bypass the data queue and accepted/processed
+counters. Explicit flush barriers retain reliable admission and may wait for
+space and completion. Important logs are diagnostic, not durable audit storage.
+No new configuration option is introduced; synchronous logging is unchanged.
