@@ -156,30 +156,27 @@ important。初始化前、关闭后不输出。
 队列只限制记录数，字节占用还取决于长消息及并发生产者。常见短消息使用
 栈缓冲和已预分配的渲染缓冲，不产生日志堆分配。
 
-=flush()= 等待在其队列位置之前已接受的记录输出并刷新。=shutdown()= 关闭
+=flush()= 在异步模式仅尝试入队刷新请求，满队列时可丢弃，不等待完成；同步刷新仍即时完成。=shutdown()= 关闭
 新接收，等待在途格式化/提交，停止周期活动，排空、刷新并回收线程；重复和
 并发关闭等待完成。正常使用时应用应先停止并 join 生产者。不要在格式化函数
 内递归调用 flush/shutdown：当前提交持有生命周期引用，可能死锁。日志接口
 不是异步信号安全函数。=deinit()= 用于 defer 尽力清理，显式 shutdown 才
 报告错误。强制退出、abort 和机器故障不保证排空；flush 不承诺 fsync 持久化。
 
-=stats()= 提供 accepted/processed、failures 和队列高水位。processed 表示
-已尝试分流，不代表成功持久化。首次格式化、提交或输出错误直接写 stderr，
-后续错误累计，使 flush/shutdown 返回 =OutputFailure=；deinit 忽略该错误。
-关闭后的最终统计仍可读取，运行中的各原子统计不是事务一致的整体快照。
+首次格式化、提交或输出错误直接写 stderr，内部保留失败状态，使 flush/shutdown
+返回 =OutputFailure=，重复关闭也保留该错误；deinit 忽略错误。容量丢弃不算输出
+故障，也不写 stderr。
 
 参见[[file:verification.org][实际验证]]及[[file:phase1_logging.org][架构与阶段归属]]。
 
 
-* 丢弃统计与控制操作
+* 非阻塞范围
 
-=stats().dropped= 统计被拒绝入队的数据记录，不是调用次数或输出行数；初始化前为零，
-关闭后保留最终值。容量丢弃不算输出故障，不导致 flush/shutdown 失败；真实 I/O、
-分配错误继续原有错误路径。丢弃的长消息缓冲立即回收。容量满时生产者不等待空位、
-不重试、不写 stderr；格式化、分配及互斥锁不承诺严格实时。
+现有队列满时直接丢弃新数据及显式 flush 请求，不等待容量或完成，不自动输出
+溢出汇总。被丢弃的长消息立即释放。shutdown 仍排空、join 并最终刷新。格式化、
+分配及互斥锁仍存在，不保证无锁或严格实时延迟。important 是诊断日志，不能替代
+持久化审计。同步模式及配置不变。
 
-现有 worker 首次发现丢弃即直接输出 warn 汇总，包含
-=dropped_delta/dropped_total/queue_size=，之后每五秒最多一次。关闭时 join worker，
-补报剩余增量并最终刷新。汇总绕过数据队列，不计入 accepted/processed。
-显式 flush 屏障保持可靠入队，允许等待空位及完成。important 用于诊断，不能替代
-持久化审计。本次不新增配置项，同步日志行为保持不变。
+删除 Stats/stats() 和 accepted/processed/dropped/高水位计数，不保留兼容空实现。
+调用方应移除统计调用，以 shutdown() 确认输出完成；真实错误通过生命周期操作
+返回，包括重复 shutdown。

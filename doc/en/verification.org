@@ -330,3 +330,27 @@ source deliverables.
 No full workspace build, sanitizer, long soak, other-platform or application
 acceptance ran. Time-text caching and timezone reload are not implemented.
 No third-party/Forge files, version, commit or push were changed.
+
+* Minimal nonblocking implementation — 2026-10-22
+
+Current code removes Stats/stats(), per-record counters, overflow reports and
+flush sequence barriers. Explicit async flush is a droppable queue request;
+shutdown remains the completion boundary and retains internal output-failure
+state for repeated shutdown and post-close flush. Earlier counters/barrier and
+performance results are historical; no new performance comparison was run.
+
+Zig 0.17.0 Debug and ReleaseFast: 25/25 unit tests and all 12 process scenarios,
+no-log/renamed consumers and the independent consumer package passed (28/28
+native steps including the existing logging/benchmark targets). Static cutoff
+checks passed in Debug (warn) and ReleaseFast (off). Formatting checks passed.
+The gated capacity-one test verifies data/flush return without waiting, retained
+queue contents and long-buffer cleanup. An accepted flush request makes buffered
+file output visible while its runtime remains alive. Failure scenarios check
+real output errors, repeated shutdown and post-close flush. NoSpaceLeft stderr
+comes from the intentional /dev/full case, not queue pressure.
+
+Existing benchmark changes only remove unsupported stats/drain metrics: it now
+labels attempted-call rates and final shutdown time explicitly. ReleaseFast
+filtered/pressure runs with 80 measured calls were bounded smoke checks only.
+No full build, performance matrix, sanitizer, dependency/version change, commit,
+installation or deployment ran. zpp and zust staged changes were preserved.

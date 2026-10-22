@@ -7,22 +7,6 @@ const output = @import("output.zig");
 const options = @import("options");
 const Allocator = std.mem.Allocator;
 
-pub const Stats = struct { dropped: u64 = 0, accepted: u64 = 0, processed: u64 = 0, failures: u64 = 0, queue_high_water: usize = 0 };
-// Worker-owned report state; shutdown accesses it only after joining.
-const OverflowReport = struct {
-    total: u64 = 0,
-    last: ?i96 = null,
-    fn delta(self: *OverflowReport, total: u64, now: i96, force: bool) ?u64 {
-        if (total == self.total) return null;
-        if (!force) if (self.last) |last| {
-            if (now - last < 5 * std.time.ns_per_s) return null;
-        };
-        const result = total - self.total;
-        self.total = total;
-        self.last = now;
-        return result;
-    }
-};
 // Independent storage: readers never touch Runtime or share the reference-count cache line.
 const FilterCache = struct {
     value: std.atomic.Value(u32) = .init(0),
@@ -36,7 +20,7 @@ var phase: std.atomic.Value(Phase) = .init(.fresh);
 var current: ?*Runtime = null;
 // Static storage prevents the final submission from waking a freed futex.
 var references: std.atomic.Value(u32) = .init(0);
-var final_stats: Stats = .{};
+var final_failed: std.atomic.Value(bool) = .init(false);
 var next_tid: std.atomic.Value(u64) = .init(0);
 threadlocal var thread_id: ?u64 = null;
 fn lockGate() void {
@@ -103,15 +87,6 @@ pub fn setLevel(level: t.Level) void {
     r.level.store(@backingInt(level), .monotonic);
     filter_cache.value.store(filterMask(r.cfg, level), .monotonic);
 }
-pub fn stats() Stats {
-    const r = acquire() orelse {
-        lockGate();
-        defer unlockGate();
-        return final_stats;
-    };
-    defer release(r);
-    return r.snapshot();
-}
 pub fn emit(comptime severity: t.Level, comptime explicit: bool, comptime source: std.lang.SourceLocation, comptime fmt: []const u8, args: anytype) void {
     if (comptime !compiled(severity)) return;
     if (!prefiltered(severity, explicit)) return;
@@ -158,15 +133,15 @@ pub fn init(a: Allocator, io: std.Io, env: *const std.process.Environ.Map, cfg: 
 }
 pub const LogGuard = struct {
     io: std.Io,
-    /// Completion barrier for records accepted before this call's queue position.
+    /// Submit a flush; async requests may drop when full and do not wait for completion.
     pub fn flush(self: LogGuard) !void {
         const r = acquire() orelse {
             while (phase.load(.acquire) == .closing) self.io.futexWaitUncancelable(Phase, &phase.raw, .closing);
-            if (stats().failures != 0) return error.OutputFailure;
+            if (final_failed.load(.monotonic)) return error.OutputFailure;
             return;
         };
         defer release(r);
-        try r.barrier();
+        try r.flush();
     }
     pub fn shutdown(self: LogGuard) !void {
         lockGate();
@@ -174,7 +149,7 @@ pub const LogGuard = struct {
         if (state != .ready) {
             unlockGate();
             while (phase.load(.acquire) == .closing) self.io.futexWaitUncancelable(Phase, &phase.raw, .closing);
-            if (stats().failures != 0) return error.OutputFailure;
+            if (final_failed.load(.monotonic)) return error.OutputFailure;
             return;
         }
         const r = current.?;
@@ -195,16 +170,15 @@ pub const LogGuard = struct {
         r.condition.broadcast(r.io);
         r.mutex.unlock(r.io);
         if (r.worker) |worker| worker.join();
-        r.reportOverflow(true);
         r.flushOutputs();
-        const result = r.snapshot();
+        const failed = r.failed.load(.monotonic);
         r.destroy();
         lockGate();
-        final_stats = result;
+        final_failed.store(failed, .monotonic);
         phase.store(.closed, .release);
         unlockGate();
         self.io.futexWake(Phase, &phase.raw, std.math.maxInt(u32));
-        if (result.failures != 0) return error.OutputFailure;
+        if (failed) return error.OutputFailure;
     }
     /// Best-effort defer cleanup; explicit shutdown is required to observe errors.
     pub fn deinit(self: LogGuard) void {
@@ -216,7 +190,7 @@ const Slot = struct {
     inline_bytes: [1024]u8 = undefined,
     heap: ?[]u8 = null,
     len: usize = 0,
-    barrier: u64 = 0,
+    flush: bool = false,
     fn bytes(s: *const Slot) []const u8 {
         return if (s.heap) |heap| heap else s.inline_bytes[0..s.len];
     }
@@ -237,20 +211,13 @@ pub const Runtime = struct {
     color: bool = false,
     pid: u32,
     level: std.atomic.Value(u8),
-    dropped: std.atomic.Value(u64) = .init(0),
-    overflow_report: OverflowReport = .{},
-    failures: std.atomic.Value(u64) = .init(0),
-    accepted: std.atomic.Value(u64) = .init(0),
-    processed: std.atomic.Value(u64) = .init(0),
-    high_water: std.atomic.Value(usize) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
     output_mutex: std.Io.Mutex = .init,
     queue: []Slot = &.{},
     head: usize = 0,
     count: usize = 0,
-    next_barrier: u64 = 0,
-    done_barrier: u64 = 0,
     stopping: bool = false,
     worker: ?std.Thread = null,
     rendered: std.Io.Writer.Allocating,
@@ -311,11 +278,8 @@ pub const Runtime = struct {
         r.arena.deinit();
         r.allocator.destroy(r);
     }
-    fn snapshot(r: *Runtime) Stats {
-        return .{ .dropped = r.dropped.load(.monotonic), .accepted = r.accepted.load(.monotonic), .processed = r.processed.load(.monotonic), .failures = r.failures.load(.monotonic), .queue_high_water = r.high_water.load(.monotonic) };
-    }
     fn failure(r: *Runtime, operation: []const u8, err: anyerror) void {
-        if (r.failures.fetchAdd(1, .monotonic) == 0) {
+        if (!r.failed.swap(true, .monotonic)) {
             var buffer: [256]u8 = undefined;
             const text = std.fmt.bufPrint(&buffer, "zzg log {s}: {s}\n", .{ operation, @errorName(err) }) catch "zzg log output failure\n";
             std.Io.File.stderr().writeStreamingAll(r.io, text) catch {};
@@ -325,7 +289,6 @@ pub const Runtime = struct {
         if (!r.cfg.async) {
             r.output_mutex.lockUncancelable(r.io);
             defer r.output_mutex.unlock(r.io);
-            _ = r.accepted.fetchAdd(1, .monotonic);
             r.writeRecord(record);
             return;
         }
@@ -334,7 +297,6 @@ pub const Runtime = struct {
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
         if (r.count == r.queue.len) {
-            _ = r.dropped.fetchAdd(1, .monotonic);
             if (heap) |bytes| r.allocator.free(bytes);
             return;
         }
@@ -343,43 +305,25 @@ pub const Runtime = struct {
         if (heap == null) @memcpy(slot.inline_bytes[0..record.message.len], record.message);
         slot.record.message = ""; // Do not retain even an unused borrowed pointer.
         r.count += 1;
-        _ = r.accepted.fetchAdd(1, .monotonic);
-        if (r.count > r.high_water.load(.monotonic)) r.high_water.store(r.count, .monotonic);
         r.condition.broadcast(r.io);
     }
-    pub fn barrier(r: *Runtime) !void {
+    pub fn flush(r: *Runtime) !void {
         if (r.cfg.async) {
             r.mutex.lockUncancelable(r.io);
-            while (r.count == r.queue.len) r.condition.waitUncancelable(r.io, &r.mutex);
-            r.next_barrier += 1;
-            const sequence = r.next_barrier;
-            r.queue[(r.head + r.count) % r.queue.len] = .{ .barrier = sequence };
-            r.count += 1;
-            if (r.count > r.high_water.load(.monotonic)) r.high_water.store(r.count, .monotonic);
-            r.condition.broadcast(r.io);
-            while (r.done_barrier < sequence) r.condition.waitUncancelable(r.io, &r.mutex);
+            if (r.count < r.queue.len) {
+                r.queue[(r.head + r.count) % r.queue.len] = .{ .flush = true };
+                r.count += 1;
+                r.condition.broadcast(r.io);
+            }
             r.mutex.unlock(r.io);
         } else {
             r.output_mutex.lockUncancelable(r.io);
             r.flushOutputs();
             r.output_mutex.unlock(r.io);
         }
-        if (r.failures.load(.monotonic) != 0) return error.OutputFailure;
-    }
-    fn reportOverflow(r: *Runtime, force: bool) void {
-        const total = r.dropped.load(.monotonic);
-        const delta = r.overflow_report.delta(total, std.Io.Clock.awake.now(r.io).nanoseconds, force) orelse return;
-        var buffer: [256]u8 = undefined;
-        const message = std.fmt.bufPrint(&buffer, "[logging:overflow] dropped_delta={d} dropped_total={d} queue_size={d}", .{ delta, total, r.cfg.queue_size }) catch unreachable;
-        const ns = std.Io.Clock.real.now(r.io).toNanoseconds();
-        if (thread_id == null) thread_id = next_tid.fetchAdd(1, .monotonic);
-        r.writeOutputs(.{ .level = .warn, .seconds = @intCast(@divFloor(ns, std.time.ns_per_s)), .micros = @intCast(@divFloor(@mod(ns, std.time.ns_per_s), 1000)), .tid = thread_id.?, .source = @src(), .message = message, .runtime = true, .important = r.cfg.important.enabled and r.cfg.important.level.accepts(.warn) });
+        if (r.failed.load(.monotonic)) return error.OutputFailure;
     }
     fn writeRecord(r: *Runtime, record: format.Record) void {
-        defer _ = r.processed.fetchAdd(1, .monotonic);
-        r.writeOutputs(record);
-    }
-    fn writeOutputs(r: *Runtime, record: format.Record) void {
         const runtime_calendar = record.runtime and (r.cfg.console or r.runtime_file != null) and r.pattern.needs_calendar;
         const important_calendar = record.important and r.important_file != null and (r.cfg.important.format == .jsonl or r.important_pattern.needs_calendar);
         const local: ?time.Calendar = if (runtime_calendar or important_calendar) r.calendar_cache.get(&r.zone, record.seconds) else null;
@@ -419,19 +363,13 @@ pub const Runtime = struct {
                 var slot = r.queue[r.head];
                 r.head = (r.head + 1) % r.queue.len;
                 r.count -= 1;
-                r.condition.broadcast(r.io);
                 r.mutex.unlock(r.io);
-                r.reportOverflow(false);
-                if (slot.barrier > 0) r.flushOutputs() else {
+                if (slot.flush) r.flushOutputs() else {
                     slot.record.message = slot.bytes();
                     r.writeRecord(slot.record);
                 }
                 if (slot.heap) |heap| r.allocator.free(heap);
                 r.mutex.lockUncancelable(r.io);
-                if (slot.barrier > 0) {
-                    r.done_barrier = slot.barrier;
-                    r.condition.broadcast(r.io);
-                }
             } else if (r.stopping) break else if (r.cfg.flush_interval_sec == 0) {
                 r.condition.waitUncancelable(r.io, &r.mutex);
             } else {
@@ -440,7 +378,6 @@ pub const Runtime = struct {
             if (r.cfg.flush_interval_sec > 0 and std.Io.Clock.awake.now(r.io).nanoseconds >= deadline.nanoseconds) {
                 r.mutex.unlock(r.io);
                 r.output_mutex.lockUncancelable(r.io);
-                r.reportOverflow(false);
                 r.flushOutputs();
                 r.output_mutex.unlock(r.io);
                 deadline = std.Io.Clock.awake.now(r.io).addDuration(interval);
@@ -477,15 +414,6 @@ test "filter snapshot covers levels, destinations and explicit important routing
     };
 }
 
-test "overflow report clock and final pending delta" {
-    var report: OverflowReport = .{};
-    try std.testing.expectEqual(@as(?u64, 2), report.delta(2, 0, false));
-    try std.testing.expectEqual(@as(?u64, null), report.delta(3, 4 * std.time.ns_per_s, false));
-    try std.testing.expectEqual(@as(?u64, 3), report.delta(5, 5 * std.time.ns_per_s, false));
-    try std.testing.expectEqual(@as(?u64, 1), report.delta(6, 5 * std.time.ns_per_s, true));
-    try std.testing.expectEqual(@as(?u64, null), report.delta(6, 6 * std.time.ns_per_s, true));
-}
-
 // Gate the existing worker before consumption; no production test hooks.
 const PausedWorker = struct {
     runtime: *Runtime,
@@ -493,6 +421,7 @@ const PausedWorker = struct {
     proceed: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(u32) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
+    flushed: std.atomic.Value(bool) = .init(false),
     fn run(self: *PausedWorker) void {
         self.ready.store(true, .release);
         while (!self.proceed.load(.acquire)) std.atomic.spinLoopHint();
@@ -509,12 +438,13 @@ const PausedWorker = struct {
         _ = self.finished.fetchAdd(1, .release);
     }
     fn flush(self: *PausedWorker) void {
-        self.runtime.barrier() catch {
+        self.runtime.flush() catch {
             self.failed.store(true, .release);
         };
+        self.flushed.store(true, .release);
     }
 };
-test "paused bounded worker drops all incoming levels and long buffers but retains barrier" {
+test "paused bounded worker drops incoming data and flush without waiting" {
     const io = std.testing.io;
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
@@ -549,18 +479,46 @@ test "paused bounded worker drops all incoming levels and long buffers but retai
     const start = std.Io.Clock.awake.now(io);
     while (gate_worker.finished.load(.acquire) != 4 and start.untilNow(io, .awake).toNanoseconds() < 2 * std.time.ns_per_s) std.atomic.spinLoopHint();
     const returned = gate_worker.finished.load(.acquire) == 4;
-    const before = r.snapshot();
     const kept = std.mem.eql(u8, r.queue[0].bytes(), "kept");
     const flushing = try std.Thread.spawn(.{}, PausedWorker.flush, .{&gate_worker});
+    const flush_start = std.Io.Clock.awake.now(io);
+    while (!gate_worker.flushed.load(.acquire) and flush_start.untilNow(io, .awake).toNanoseconds() < 2 * std.time.ns_per_s) std.atomic.spinLoopHint();
+    const flush_returned = gate_worker.flushed.load(.acquire);
+    const count = r.count; // Producers finished and the worker remains paused.
     gate_worker.proceed.store(true, .release);
     flushing.join();
     try std.testing.expect(returned);
     try std.testing.expect(kept);
-    try std.testing.expectEqual(@as(u64, 1), before.accepted);
-    try std.testing.expectEqual(@as(u64, 80), before.dropped);
-    try std.testing.expectEqual(@as(u64, 1), r.snapshot().processed);
+    try std.testing.expect(flush_returned);
+    try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expect(!gate_worker.failed.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 0), r.snapshot().failures);
+    try std.testing.expect(!r.failed.load(.monotonic));
+}
+
+test "accepted async flush request writes buffered output before destruction" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try tmp.dir.realPath(io, &buffer);
+    const path = try std.fs.path.join(a, &.{ buffer[0..length], "runtime.log" });
+    defer a.free(path);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("TZ", "UTC0");
+    const r = try Runtime.create(a, io, &env, .{ .console = false, .rotating_file = true, .name = path, .pattern = "%v", .flush_interval_sec = 0, .flush_level = .off });
+    defer r.destroy();
+    r.queue = try a.alloc(Slot, 2);
+    r.cfg.async = true;
+    try r.submit(.{ .level = .info, .seconds = 0, .micros = 0, .tid = 0, .source = @src(), .message = "kept", .runtime = true, .important = false });
+    try r.flush();
+    // Run the same worker loop deterministically, stopping after queued work.
+    r.stopping = true;
+    Runtime.work(r);
+    const actual = try tmp.dir.readFileAlloc(io, "runtime.log", a, .limited(65536));
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("kept\n", actual);
 }
 
 test "calendar conversion follows active destinations and inherited patterns" {
@@ -609,7 +567,7 @@ test "calendar conversion follows active destinations and inherited patterns" {
                     try std.testing.expectEqual(expected, r.calendar_cache.conversions);
                 }
             };
-            try r.barrier();
+            try r.flush();
         }
     };
 }
@@ -634,14 +592,15 @@ test "paused async backlog formats record timestamps and microseconds in queue o
     r.cfg.async = true;
     var worker_state: PausedWorker = .{ .runtime = r };
     const worker = try std.Thread.spawn(.{}, PausedWorker.run, .{&worker_state});
-    defer {
+    var joined = false;
+    defer if (!joined) {
         r.mutex.lockUncancelable(io);
         r.stopping = true;
         r.condition.broadcast(io);
         r.mutex.unlock(io);
         worker_state.proceed.store(true, .release);
         worker.join();
-    }
+    };
     const seconds = [_]i64{ 100, 100, 101, 100, -1, 0 };
     const micros = [_]u32{ 1, 999999, 123456, 654321, 999999, 0 };
     var text: std.Io.Writer.Allocating = .init(a);
@@ -656,11 +615,14 @@ test "paused async backlog formats record timestamps and microseconds in queue o
         try format.json(&json.writer, record, r.cfg, direct, r.pid);
     }
     try std.testing.expectEqual(@as(usize, 0), r.calendar_cache.conversions);
+    r.mutex.lockUncancelable(io);
+    r.stopping = true;
+    r.mutex.unlock(io);
     worker_state.proceed.store(true, .release);
-    try r.barrier();
-    // barrier observes worker writes; it stays idle until this test's deferred join.
+    worker.join();
+    joined = true;
+    r.flushOutputs();
     try std.testing.expectEqual(@as(usize, 5), r.calendar_cache.conversions);
-    try std.testing.expectEqual(@as(u64, 6), r.snapshot().processed);
     const actual_text = try tmp.dir.readFileAlloc(io, "runtime.log", a, .limited(65536));
     defer a.free(actual_text);
     const actual_json = try tmp.dir.readFileAlloc(io, "important.jsonl", a, .limited(65536));
@@ -669,7 +631,7 @@ test "paused async backlog formats record timestamps and microseconds in queue o
     try std.testing.expectEqualStrings(json.written(), actual_json);
 }
 
-test "synchronous producers retain complete fractional timestamps and overflow shares the cache" {
+test "synchronous producers retain complete fractional timestamps" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -707,7 +669,7 @@ test "synchronous producers retain complete fractional timestamps and overflow s
     for (workers) |worker| worker.join();
     spawned = 0;
     for (producers) |producer| try std.testing.expect(!producer.failed);
-    try r.barrier();
+    try r.flush();
     const actual = try tmp.dir.readFileAlloc(io, "runtime.log", a, .limited(65536));
     defer a.free(actual);
     try std.testing.expectEqual(@as(usize, 200), std.mem.count(u8, actual, "\n"));
@@ -716,15 +678,4 @@ test "synchronous producers retain complete fractional timestamps and overflow s
         const expected = try std.fmt.bufPrint(&line, "{d:0>2}.{d:0>6} {d:0>2} payload\n", .{ i % 2, id * 100 + i, id });
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, actual, expected));
     };
-    const before = r.calendar_cache.conversions;
-    r.dropped.store(3, .monotonic);
-    r.reportOverflow(true);
-    try std.testing.expectEqual(before + 1, r.calendar_cache.conversions);
-    const overflow_seconds = r.calendar_cache.seconds.?;
-    try r.submit(.{ .level = .info, .seconds = overflow_seconds, .micros = 123456, .tid = 0, .source = @src(), .message = "after overflow", .runtime = true, .important = false });
-    try std.testing.expectEqual(before + 1, r.calendar_cache.conversions);
-    try r.submit(.{ .level = .info, .seconds = 0, .micros = 654321, .tid = 0, .source = @src(), .message = "historical", .runtime = true, .important = false });
-    try std.testing.expectEqual(before + 2, r.calendar_cache.conversions);
-    try r.barrier();
-    try std.testing.expectEqual(@as(u64, 202), r.snapshot().processed);
 }

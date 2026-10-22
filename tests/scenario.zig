@@ -96,17 +96,10 @@ fn levelRace(init: std.process.Init, guard: z.log.LogGuard, path: []const u8, sh
         const bytes = try read(init, path);
         defer init.gpa.free(bytes);
         try require(std.mem.endsWith(u8, bytes, "stable-warning\n"));
-        var lines: usize = 0;
-        var rows = std.mem.splitScalar(u8, bytes, '\n');
-        while (rows.next()) |row| {
-            if (row.len > 0 and std.mem.indexOf(u8, row, "[logging:overflow]") == null) lines += 1;
-        }
-        try require(z.log.stats().accepted == lines + 1 and z.log.stats().processed == lines + 1);
     } else {
         const bytes = try read(init, path);
         defer init.gpa.free(bytes);
         try require(std.mem.eql(u8, bytes, "in-flight\n"));
-        try require(z.log.stats().accepted == 1 and z.log.stats().processed == 1);
     }
 }
 pub fn main(init: std.process.Init) !void {
@@ -181,12 +174,25 @@ pub fn main(init: std.process.Init) !void {
         try require(!formatted);
         if (important_only) z.log.important(@src(), "explicit-only", .{});
         try guard.flush();
-        try require(z.log.stats().accepted == @as(u64, if (important_only) 1 else 0));
+        if (read(init, path)) |bytes| {
+            init.gpa.free(bytes);
+            return error.UnexpectedRuntimeFile;
+        } else |err| try require(err == error.FileNotFound);
+        if (important_only) {
+            const output = try read(init, important);
+            defer init.gpa.free(output);
+            try require(std.mem.indexOf(u8, output, "explicit-only") != null);
+        }
     } else if (std.mem.eql(u8, mode, "async")) {
         var threads: [4]std.Thread = undefined;
         for (&threads, 0..) |*thread, id| thread.* = try std.Thread.spawn(.{}, produce, .{id});
         for (threads) |thread| thread.join();
-        try guard.flush(); // Must make bytes visible before shutdown.
+        var failed: std.atomic.Value(bool) = .init(false);
+        const one = try std.Thread.spawn(.{}, close, .{ guard, &failed });
+        const two = try std.Thread.spawn(.{}, close, .{ guard, &failed });
+        one.join();
+        two.join();
+        try require(!failed.load(.acquire));
         const bytes = try read(init, path);
         defer init.gpa.free(bytes);
         var seen: [2000]bool = @splat(false);
@@ -194,7 +200,6 @@ pub fn main(init: std.process.Init) !void {
         var count: usize = 0;
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            if (std.mem.indexOf(u8, line, "[logging:overflow]") != null) continue;
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedRecord;
             const thread = try std.fmt.parseInt(usize, line[0..colon], 10);
             const number = try std.fmt.parseInt(usize, line[colon + 1 ..], 10);
@@ -204,14 +209,7 @@ pub fn main(init: std.process.Init) !void {
             seen[index] = true;
             count += 1;
         }
-        try require(count + z.log.stats().dropped == 2000 and z.log.stats().queue_high_water <= 2);
-        var failed: std.atomic.Value(bool) = .init(false);
-        const one = try std.Thread.spawn(.{}, close, .{ guard, &failed });
-        const two = try std.Thread.spawn(.{}, close, .{ guard, &failed });
-        one.join();
-        two.join();
-        try require(!failed.load(.acquire));
-        try require(z.log.stats().accepted == count and z.log.stats().processed == count and z.log.stats().accepted + z.log.stats().dropped == 2000);
+        try require(count > 0 and count <= 2000);
     } else if (std.mem.eql(u8, mode, "long")) {
         const payload = try init.gpa.alloc(u8, 4096);
         defer init.gpa.free(payload);
@@ -220,7 +218,7 @@ pub fn main(init: std.process.Init) !void {
         @memset(payload, 'y');
         z.log.info(@src(), "{s}", .{payload});
         @memset(payload, 'z');
-        try guard.flush();
+        try guard.shutdown();
         const bytes = try read(init, path);
         defer init.gpa.free(bytes);
         try require(bytes.len == 8194 and bytes[4096] == '\n' and bytes[8193] == '\n');
@@ -231,7 +229,7 @@ pub fn main(init: std.process.Init) !void {
             const thread = try std.Thread.spawn(.{}, metadataProducer, .{id});
             thread.join();
         }
-        try guard.flush();
+        try guard.shutdown();
         const bytes = try read(init, path);
         defer init.gpa.free(bytes);
         var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -257,7 +255,6 @@ pub fn main(init: std.process.Init) !void {
         const bytes = try read(init, path);
         defer init.gpa.free(bytes);
         try require(std.mem.eql(u8, bytes, "in-flight\n"));
-        try require(z.log.stats().accepted == 1 and z.log.stats().processed == 1);
     } else if (std.mem.eql(u8, mode, "sync")) {
         z.log.info(@src(), "ordinary", .{});
         z.log.warn(@src(), "[test:warn] warning", .{});
@@ -290,7 +287,8 @@ pub fn main(init: std.process.Init) !void {
         defer init.gpa.free(bytes);
         try require(std.mem.eql(u8, bytes, "survives-other-sink-failure\n"));
         if (guard.shutdown()) |_| return error.MissingShutdownFailure else |err| try require(err == error.OutputFailure);
-        try require(z.log.stats().failures > 0);
+        if (guard.shutdown()) |_| return error.MissingRepeatedFailure else |err| try require(err == error.OutputFailure);
+        if (guard.flush()) |_| return error.MissingClosedFailure else |err| try require(err == error.OutputFailure);
         return;
     } else if (std.mem.eql(u8, mode, "rotate")) {
         const big = try init.gpa.alloc(u8, 1024 * 1024 + 17);

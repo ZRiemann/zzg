@@ -5,6 +5,19 @@
 
 * Releases
 
+** v0.1.2 - 2026-10-22T06:10:52Z
+:PROPERTIES:
+:CUSTOM_ID: v0.1.2
+:END:
+
+- Remove the public logging statistics API and counters, overflow summaries,
+  and async flush completion barriers; async flush is now a best-effort request,
+  while shutdown remains the completion boundary.
+- Update the benchmark and bilingual logging/verification documentation to
+  describe the reduced metrics and lifecycle behavior. Existing recorded
+  validation passed; no additional tests or builds were run for this commit.
+- No push or release was performed.
+
 ** v0.1.1 - 2026-10-22T03:31:11Z
 :PROPERTIES:
 :CUSTOM_ID: v0.1.1

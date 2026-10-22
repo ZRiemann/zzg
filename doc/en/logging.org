@@ -185,8 +185,8 @@ truncated, and are freed after processing. Record count is bounded; byte usage
 also depends on long payloads and concurrent producers. Standard buffers and
 preallocated render storage avoid logger heap allocation for short messages.
 
-=flush()= is a completion barrier for records already accepted before its queue
-position. =shutdown()= closes admission, waits for in-flight formatting and
+=flush()= submits an asynchronous flush request without waiting for completion;
+full queues may discard it. Synchronous flush still completes immediately. =shutdown()= closes admission, waits for in-flight formatting and
 submission, stops periodic activity, drains, flushes and joins workers. Repeated
 or concurrent shutdown waits for completion. Stop/join application producers
 first in normal use. Do not call flush/shutdown recursively from a formatter:
@@ -195,29 +195,23 @@ async-signal-safe. =deinit()= is best-effort defer cleanup; explicit shutdown
 reports errors. Forced exit, abort and machine failure cannot guarantee draining.
 Flush means userspace buffer flush, not fsync durability.
 
-=stats()= reports accepted/processed records, failures and queue high-water
-mark. Processed means attempted routing, not guaranteed persistence. The first
-format/submission/output error is written directly to stderr; errors accumulate
-and make flush/shutdown return =OutputFailure=. =deinit()= discards that error.
-After shutdown final stats remain queryable. Stats during active processing are
-independent atomic snapshots, not a transactionally consistent tuple.
+The first format/submission/output error is written directly to stderr and
+retained internally so flush/shutdown report =OutputFailure=. =deinit()= discards
+that error. Capacity drops are not output failures and do not write stderr.
 
 See [[file:verification.org][actual validation]] and [[file:phase1_logging.org][architecture and Stage ownership]].
 
 
-* Overflow statistics and controls
+* Nonblocking scope
 
-=stats().dropped= counts rejected queue data records, not calls or sink lines.
-It starts at zero and remains readable after shutdown. Capacity drops are not
-output failures and do not fail flush/shutdown; real I/O and allocation failures
-retain their existing error path. Dropped long buffers are reclaimed immediately.
-The producer does not wait for capacity, retry, or write stderr on capacity loss;
-formatting, allocation and mutexes are not a hard real-time guarantee.
+The existing queue discards incoming data and explicit flush requests when full;
+there is no capacity wait, completion barrier or automatic overflow summary.
+Dropped long buffers are freed immediately. Shutdown still drains, joins and
+finally flushes. Formatting, allocation and mutexes remain; this is not a
+lock-free or hard-real-time guarantee. Important is diagnostic, not durable audit
+storage. Synchronous logging and configuration remain unchanged.
 
-The existing worker writes a direct warn summary with
-=dropped_delta/dropped_total/queue_size= on first observed loss, then at most
-once every five seconds. Shutdown joins the worker, reports any remaining delta
-and finally flushes. Summaries bypass the data queue and accepted/processed
-counters. Explicit flush barriers retain reliable admission and may wait for
-space and completion. Important logs are diagnostic, not durable audit storage.
-No new configuration option is introduced; synchronous logging is unchanged.
+Stats/stats() and their accepted/processed/dropped/high-water counters have been
+removed, without compatibility stubs. Consumers must remove those calls and use
+shutdown() for an output completion boundary. Internal failure state remains
+available through lifecycle operation errors, including repeated shutdown.

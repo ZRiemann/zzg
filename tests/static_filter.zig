@@ -13,6 +13,5 @@ pub fn main(init: std.process.Init) !void {
     if (z.log.enabled(.info) or z.log.importantEnabled()) return error.CompiledFilterIgnored;
     z.log.info(@src(), "invalid format {never-analyzed}", .{});
     z.log.important(@src(), "invalid format {never-analyzed}", .{});
-    if (z.log.stats().accepted != 0) return error.CompiledFilterIgnored;
     try guard.shutdown();
 }

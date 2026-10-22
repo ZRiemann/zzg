@@ -8,7 +8,6 @@ pub const Level = types.Level;
 pub const SinkFormat = types.SinkFormat;
 pub const Diagnostic = types.Diagnostic;
 pub const LogGuard = runtime.LogGuard;
-pub const Stats = runtime.Stats;
 pub const LoadedConfig = @import("log/config.zig").LoadedConfig;
 pub const fromSpdJson = @import("log/config.zig").fromSpdJson;
 pub const fromZppFile = @import("log/config.zig").fromZppFile;
@@ -16,7 +15,6 @@ pub const init = runtime.init;
 pub const enabled = runtime.enabled;
 pub const importantEnabled = runtime.importantEnabled;
 pub const setLevel = runtime.setLevel;
-pub const stats = runtime.stats;
 pub fn trace(comptime src: std.lang.SourceLocation, comptime fmt: []const u8, args: anytype) void {
     runtime.emit(.trace, false, src, fmt, args);
 }

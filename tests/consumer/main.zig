@@ -12,5 +12,4 @@ pub fn main(init: std.process.Init) !void {
         if (err != error.AlreadyInitialized) return err;
     }
     try guard.shutdown();
-    if (z.log.stats().dropped != 0 or independent.log.stats().dropped != 0) return error.UnexpectedDrop;
 }

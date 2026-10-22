@@ -39,8 +39,8 @@ closed; failed init returns to fresh. Formatter reentrant shutdown/flush is unsu
 
 Hot-path boundaries: filtered calls do not format or allocate; short payloads
 use stack storage and inline queue slots; output render/file buffers are reused.
-Async queues discard incoming data when full and count capacity drops separately.
-Flush barriers remain reliable. Long payloads allocate explicitly.
+Async queues discard incoming data and flush requests when full. Explicit flush
+is best-effort admission, not a completion barrier; shutdown drains and joins. Long payloads allocate explicitly.
 A single async worker establishes accepted order; independent output failures
 are observable without suppressing healthy destinations.
 
@@ -85,7 +85,7 @@ scenarios provide seams without a public plugin system.
 * Stage 1.4 — asynchronous lifecycle and integration
 
 - Owner: zzg; prerequisite Stage 1.3.
-- Deliverables: bounded queue, single worker, periodic flush, completion barrier,
+- Deliverables: bounded queue, single worker, periodic/best-effort explicit flush,
   idempotent concurrent shutdown, caller metadata and owned handoff, benchmarks.
 - Acceptance: multi-producer capacity-2 queue, record uniqueness/completeness,
   long message ownership, >64 short thread IDs, caller source, in-flight

@@ -93,8 +93,7 @@ by this overhead.
 
 =--format payload|default|jsonl= selects message-only =%v= (the default), the
 standard text pattern, or important-only JSONL receiving info records. JSONL
-disables ordinary outputs; normal level filtering and count conservation still
-apply. =--tz STRING= selects the initialization timezone snapshot and defaults
+disables ordinary outputs; normal level filtering still applies. =--tz STRING= selects the initialization timezone snapshot and defaults
 to =UTC0=. Empty STRING means UTC; whitespace/control characters are rejected
 so the machine-readable result remains one line. Other timezone validation is
 the same as the logger's. Results include =format= and =tz= alongside existing
@@ -110,45 +109,27 @@ for threads in 1 2 4 8; do
 done
 #+end_src
 
-Mixed uses synchronous file output at runtime level info, issuing nine filtered
-debug calls then one accepted info per ten calls. Measured counts must be
-multiples of ten per producer. Filtered and short-message rounds assert zero
-logger heap allocations; each round independently checks formatter invocation,
-accepted/processed/dropped deltas and output failures. Pressure defaults to four
-producers and queue capacity 2; other async modes use capacity 64. Long payloads
-contain 4,096 bytes. Shutdown must reclaim all logger allocator bytes.
+Mixed uses synchronous output at info: nine filtered debug calls then one
+eligible info per ten attempts. Each round checks formatter invocation counts;
+synchronous short-message rounds assert zero hot logger allocations. Async
+allocation windows include concurrent worker activity and are reported without
+that zero-allocation assertion. Pressure uses four producers and capacity 2;
+other async modes use capacity 64. Long values contain 4096 bytes.
 
-=batch_calls_per_sec= measures attempted batch caller throughput;
-=batch_drain_per_sec= measures accepted records through the final flush. Existing =submit_per_sec= (attempts), =drain_per_sec= (accepted), =drain_ns=
-and p50/p99 describe the separate latency round and include per-call clocks.
-=hot_allocations= is the latency-round count; =batch_hot_allocations= covers the
-batch round. Final accepted/processed totals include warm-up and both rounds:
-filtered is zero; mixed is one tenth; other modes satisfy accepted + dropped =
-attempted. =processed= equals =accepted= after flushing.
-=records= counts attempted calls per round, not final accepted records.
-=peak_allocated_bytes= includes logger initialization, but excludes process RSS
-and Io/thread internals. Temporary files are process-owned and removed on exit.
-User buffer flushing is not fsync or durable storage throughput. The formatter
-counter is a shared atomic in both compared binaries and adds instrumentation
-cost to accepted calls. Latency sampling is likewise not a logger-only SLA.
+=batch_attempts_per_sec= and =latency_attempts_per_sec= count attempted calls,
+including filtered and rejected calls. They are not consumed-record throughput.
+p50/p99 describe the separate latency round. =hot_allocations= and
+=batch_hot_allocations= report allocator calls in those respective windows;
+=peak_allocated_bytes= includes initialization and excludes process RSS and
+Io/thread internals. Producer threads stop before the final shutdown interval;
+=shutdown_ns= measures the remaining drain/join/final-flush operation. All logger
+allocator bytes must be reclaimed afterward. Flush is not a completion barrier.
 
-For paired comparisons, keep the same benchmark source in an isolated snapshot
-of the current worktree (including staged/untracked implementation) and the
-modified checkout. Build both as ReleaseFast with the exact toolchain, then run
-baseline/modified alternately, reversing pair order each repetition. Use seven
-repetitions, 200,000 calls per measured round, the same CPU affinity/environment
-and output configuration. Report medians, inclusive Q1/Q3, throughput ratios and
-p99; inspect enabled-mode throughput loss or p99 increase exceeding 10% before
-accepting. Do not compare the historical single-round numbers directly with
-this new two-round harness, or claim a comparison against spdlog.
-
-Capacity pressure can now drop new data. Reports include total =dropped= and
-=batch_accepted/batch_dropped/latency_accepted/latency_dropped=. Each round
-checks eligible attempts = accepted + dropped; formatter invocations still count
-eligible attempts, even when admission fails. Overflow summaries are excluded
-from data counts. Do not interpret increased attempted-call throughput as
-increased file-output throughput; compare accepted rates together with drop counts.
-Historical blocking-baseline measurements above retain their historical meaning.
+There are no accepted/processed/dropped/high-water metrics or per-round drain
+rates. Temporary files are removed on exit; flushing does not imply fsync.
+No new performance comparison is part of the nonblocking simplification.
+Historical measurements below used the earlier statistics/barrier harness;
+retained binaries and results describe that older implementation.
 
 * Calendar optimization comparison (2026-10-22)
 
