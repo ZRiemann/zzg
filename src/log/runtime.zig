@@ -229,6 +229,7 @@ pub const Runtime = struct {
     arena: std.heap.ArenaAllocator,
     cfg: t.Config,
     zone: time.Zone,
+    calendar_cache: time.CalendarCache = .{},
     pattern: format.Pattern,
     important_pattern: format.Pattern,
     runtime_file: ?output.FileSink = null,
@@ -379,7 +380,9 @@ pub const Runtime = struct {
         r.writeOutputs(record);
     }
     fn writeOutputs(r: *Runtime, record: format.Record) void {
-        const local = r.zone.local(record.seconds, record.micros);
+        const runtime_calendar = record.runtime and (r.cfg.console or r.runtime_file != null) and r.pattern.needs_calendar;
+        const important_calendar = record.important and r.important_file != null and (r.cfg.important.format == .jsonl or r.important_pattern.needs_calendar);
+        const local: ?time.Calendar = if (runtime_calendar or important_calendar) r.calendar_cache.get(&r.zone, record.seconds) else null;
         if (record.runtime) {
             if (r.cfg.console) {
                 r.rendered.writer.end = 0;
@@ -396,7 +399,7 @@ pub const Runtime = struct {
         }
         if (record.important) if (r.important_file) |*file| {
             r.rendered.writer.end = 0;
-            const result = if (r.cfg.important.format == .jsonl) format.json(&r.rendered.writer, record, r.cfg, local, r.pid) else r.important_pattern.render(&r.rendered.writer, record, r.cfg, local, r.pid, false);
+            const result = if (r.cfg.important.format == .jsonl) format.json(&r.rendered.writer, record, r.cfg, local.?, r.pid) else r.important_pattern.render(&r.rendered.writer, record, r.cfg, local, r.pid, false);
             if (result) |_| {
                 file.write(r.rendered.written()) catch |err| r.failure("important file", err);
             } else |err| r.failure("important format", err);
@@ -558,4 +561,170 @@ test "paused bounded worker drops all incoming levels and long buffers but retai
     try std.testing.expectEqual(@as(u64, 1), r.snapshot().processed);
     try std.testing.expect(!gate_worker.failed.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), r.snapshot().failures);
+}
+
+test "calendar conversion follows active destinations and inherited patterns" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("TZ", "UTC0");
+    const Important = struct { enabled: bool, format: t.SinkFormat = .pattern, pattern: []const u8 = "" };
+    const important_cases = [_]Important{
+        .{ .enabled = false },
+        .{ .enabled = true },
+        .{ .enabled = true, .pattern = "%v" },
+        .{ .enabled = true, .pattern = "%S" },
+        .{ .enabled = true, .format = .jsonl },
+    };
+    for ([_]bool{ false, true }) |file_enabled| for ([_][]const u8{ "", "%v", "%%Y %e %f", "%S" }) |pattern| {
+        for (important_cases) |important| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const length = try tmp.dir.realPath(io, &buffer);
+            const path = try std.fs.path.join(a, &.{ buffer[0..length], "runtime.log" });
+            defer a.free(path);
+            const important_path = try std.fs.path.join(a, &.{ buffer[0..length], "important.log" });
+            defer a.free(important_path);
+            const r = try Runtime.create(a, io, &env, .{
+                .console = false,
+                .rotating_file = file_enabled,
+                .name = path,
+                .pattern = pattern,
+                .flush_interval_sec = 0,
+                .flush_level = .off,
+                .important = .{ .enabled = important.enabled, .name = important_path, .format = important.format, .pattern = important.pattern },
+            });
+            defer r.destroy();
+            if (important.pattern.len == 0) try std.testing.expectEqual(r.pattern.needs_calendar, r.important_pattern.needs_calendar);
+            var expected: usize = 0;
+            for ([_]bool{ false, true }) |ordinary_route| for ([_]bool{ false, true }) |important_route| {
+                const seconds: i64 = @as(i64, if (ordinary_route) 2 else 0) + @as(i64, if (important_route) 1 else 0);
+                const needs = (ordinary_route and file_enabled and r.pattern.needs_calendar) or
+                    (important_route and important.enabled and (important.format == .jsonl or r.important_pattern.needs_calendar));
+                if (needs) expected += 1;
+                for ([_]u32{ 1, 999999 }) |micros| {
+                    try r.submit(.{ .level = .info, .seconds = seconds, .micros = micros, .tid = 0, .source = @src(), .message = "payload", .runtime = ordinary_route, .important = important_route });
+                    try std.testing.expectEqual(expected, r.calendar_cache.conversions);
+                }
+            };
+            try r.barrier();
+        }
+    };
+}
+
+test "paused async backlog formats record timestamps and microseconds in queue order" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try tmp.dir.realPath(io, &buffer);
+    const path = try std.fs.path.join(a, &.{ buffer[0..length], "runtime.log" });
+    defer a.free(path);
+    const important_path = try std.fs.path.join(a, &.{ buffer[0..length], "important.jsonl" });
+    defer a.free(important_path);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("TZ", "UTC0");
+    const r = try Runtime.create(a, io, &env, .{ .console = false, .rotating_file = true, .name = path, .pattern = "%Y-%m-%d %H:%M:%S.%f %v", .flush_interval_sec = 0, .flush_level = .off, .important = .{ .enabled = true, .name = important_path } });
+    defer r.destroy();
+    r.queue = try a.alloc(Slot, 8);
+    r.cfg.async = true;
+    var worker_state: PausedWorker = .{ .runtime = r };
+    const worker = try std.Thread.spawn(.{}, PausedWorker.run, .{&worker_state});
+    defer {
+        r.mutex.lockUncancelable(io);
+        r.stopping = true;
+        r.condition.broadcast(io);
+        r.mutex.unlock(io);
+        worker_state.proceed.store(true, .release);
+        worker.join();
+    }
+    const seconds = [_]i64{ 100, 100, 101, 100, -1, 0 };
+    const micros = [_]u32{ 1, 999999, 123456, 654321, 999999, 0 };
+    var text: std.Io.Writer.Allocating = .init(a);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(a);
+    defer json.deinit();
+    for (seconds, micros) |epoch, fraction| {
+        const record: format.Record = .{ .level = .warn, .seconds = epoch, .micros = fraction, .tid = 7, .source = @src(), .message = "[backlog:check] payload", .runtime = true, .important = true };
+        try r.submit(record);
+        const direct = r.zone.local(epoch, fraction);
+        try r.pattern.render(&text.writer, record, r.cfg, direct, r.pid, false);
+        try format.json(&json.writer, record, r.cfg, direct, r.pid);
+    }
+    try std.testing.expectEqual(@as(usize, 0), r.calendar_cache.conversions);
+    worker_state.proceed.store(true, .release);
+    try r.barrier();
+    // barrier observes worker writes; it stays idle until this test's deferred join.
+    try std.testing.expectEqual(@as(usize, 5), r.calendar_cache.conversions);
+    try std.testing.expectEqual(@as(u64, 6), r.snapshot().processed);
+    const actual_text = try tmp.dir.readFileAlloc(io, "runtime.log", a, .limited(65536));
+    defer a.free(actual_text);
+    const actual_json = try tmp.dir.readFileAlloc(io, "important.jsonl", a, .limited(65536));
+    defer a.free(actual_json);
+    try std.testing.expectEqualStrings(text.written(), actual_text);
+    try std.testing.expectEqualStrings(json.written(), actual_json);
+}
+
+test "synchronous producers retain complete fractional timestamps and overflow shares the cache" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try tmp.dir.realPath(io, &buffer);
+    const path = try std.fs.path.join(a, &.{ buffer[0..length], "runtime.log" });
+    defer a.free(path);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("TZ", "UTC0");
+    const r = try Runtime.create(a, io, &env, .{ .console = false, .rotating_file = true, .name = path, .pattern = "%S.%f %t %v", .flush_interval_sec = 0, .flush_level = .off });
+    defer r.destroy();
+    const Producer = struct {
+        runtime: *Runtime,
+        id: u32,
+        failed: bool = false,
+        fn run(p: *@This()) void {
+            for (0..50) |i| {
+                p.runtime.submit(.{ .level = .info, .seconds = @intCast(i % 2), .micros = p.id * 100 + @as(u32, @intCast(i)), .tid = p.id, .source = @src(), .message = "payload", .runtime = true, .important = false }) catch {
+                    p.failed = true;
+                };
+            }
+        }
+    };
+    var producers: [4]Producer = undefined;
+    var workers: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (workers[0..spawned]) |worker| worker.join();
+    for (&producers, &workers, 0..) |*producer, *worker, id| {
+        producer.* = .{ .runtime = r, .id = @intCast(id) };
+        worker.* = try std.Thread.spawn(.{}, Producer.run, .{producer});
+        spawned += 1;
+    }
+    for (workers) |worker| worker.join();
+    spawned = 0;
+    for (producers) |producer| try std.testing.expect(!producer.failed);
+    try r.barrier();
+    const actual = try tmp.dir.readFileAlloc(io, "runtime.log", a, .limited(65536));
+    defer a.free(actual);
+    try std.testing.expectEqual(@as(usize, 200), std.mem.count(u8, actual, "\n"));
+    for (0..4) |id| for (0..50) |i| {
+        var line: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&line, "{d:0>2}.{d:0>6} {d:0>2} payload\n", .{ i % 2, id * 100 + i, id });
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, actual, expected));
+    };
+    const before = r.calendar_cache.conversions;
+    r.dropped.store(3, .monotonic);
+    r.reportOverflow(true);
+    try std.testing.expectEqual(before + 1, r.calendar_cache.conversions);
+    const overflow_seconds = r.calendar_cache.seconds.?;
+    try r.submit(.{ .level = .info, .seconds = overflow_seconds, .micros = 123456, .tid = 0, .source = @src(), .message = "after overflow", .runtime = true, .important = false });
+    try std.testing.expectEqual(before + 1, r.calendar_cache.conversions);
+    try r.submit(.{ .level = .info, .seconds = 0, .micros = 654321, .tid = 0, .source = @src(), .message = "historical", .runtime = true, .important = false });
+    try std.testing.expectEqual(before + 2, r.calendar_cache.conversions);
+    try r.barrier();
+    try std.testing.expectEqual(@as(u64, 202), r.snapshot().processed);
 }

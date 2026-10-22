@@ -5,6 +5,22 @@ const invalid = error.InvalidTimezone;
 
 pub const Calendar = struct { year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8, microsecond: u32 };
 
+/// One immutable Zone per cache; its Runtime serializes all access.
+pub const CalendarCache = struct {
+    seconds: ?i64 = null,
+    value: Calendar = undefined,
+    conversions: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
+
+    pub fn get(c: *CalendarCache, zone: *const Zone, seconds: i64) Calendar {
+        if (c.seconds == null or c.seconds.? != seconds) {
+            c.value = zone.local(seconds, 0);
+            c.seconds = seconds;
+            if (@import("builtin").is_test) c.conversions += 1;
+        }
+        return c.value;
+    }
+};
+
 pub fn daysFromCivil(year: i32, month: u8, day: u8) i64 {
     const y: i64 = @as(i64, year) - @as(i64, if (month <= 2) 1 else 0);
     const era = @divFloor(y, 400);
@@ -373,4 +389,59 @@ test "TZif allocation failures release all owned state" {
     const bytes = try fixture(std.testing.allocator, '4');
     defer std.testing.allocator.free(bytes);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationProbe, .{bytes});
+}
+
+test "calendar cache starts empty and reuses only the immediately preceding UTC second" {
+    const zone = Zone.utc(std.testing.allocator);
+    var cache: CalendarCache = .{};
+    try std.testing.expectEqual(@as(?i64, null), cache.seconds);
+    const seconds = [_]i64{ 0, 0, -1, -1, 86399, 86400, 100, 101, 100 };
+    const conversions = [_]usize{ 1, 1, 2, 2, 3, 4, 5, 6, 7 };
+    for (seconds, conversions) |epoch, count| {
+        try std.testing.expectEqualDeep(zone.local(epoch, 0), cache.get(&zone, epoch));
+        try std.testing.expectEqual(count, cache.conversions);
+        try std.testing.expectEqual(@as(u32, 0), cache.value.microsecond);
+    }
+}
+
+test "calendar cache follows fixed offsets and northern and southern future DST boundaries" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "UTC0", "CST-8", "EST5EDT,M3.2.0,M11.1.0", "AEST-10AEDT,M10.1.0,M4.1.0/3" }) |text| {
+        const zone: Zone = .{ .allocator = a, .future = try Posix.parse(text) };
+        var cache: CalendarCache = .{};
+        const spring = daysFromCivil(2050, 3, 13) * 86400 + 7 * 3600;
+        const fall = daysFromCivil(2050, 11, 6) * 86400 + 6 * 3600;
+        const southern_start = if (zone.future.?.daylight != null) zone.future.?.start.transition(2050, zone.future.?.standard) else 0;
+        const southern_end = if (zone.future.?.daylight) |dst| zone.future.?.end.transition(2050, dst) else 0;
+        for ([_]i64{ -1, 0, spring - 1, spring, fall - 1, fall, southern_start - 1, southern_start, southern_end - 1, southern_end, 4102444800 }) |epoch| {
+            const local = cache.get(&zone, epoch);
+            try std.testing.expectEqualDeep(zone.local(epoch, 0), local);
+            const count = cache.conversions;
+            try std.testing.expectEqualDeep(local, cache.get(&zone, epoch));
+            try std.testing.expectEqual(count, cache.conversions);
+        }
+    }
+}
+
+test "calendar cache follows a TZif offset transition and backward timestamps" {
+    var bytes: [69]u8 = @splat(0);
+    @memcpy(bytes[0..4], "TZif");
+    std.mem.writeInt(u32, bytes[32..36], 1, .big);
+    std.mem.writeInt(u32, bytes[36..40], 2, .big);
+    std.mem.writeInt(u32, bytes[40..44], 8, .big);
+    std.mem.writeInt(i32, bytes[44..48], 100, .big);
+    bytes[48] = 1;
+    std.mem.writeInt(i32, bytes[55..59], 3600, .big);
+    bytes[59] = 1;
+    bytes[60] = 4;
+    @memcpy(bytes[61..69], "UTC\x00DST\x00");
+    var zone = try Zone.parse(std.testing.allocator, &bytes);
+    defer zone.deinit();
+    var cache: CalendarCache = .{};
+    for ([_]i64{ 99, 100, 101, 100, 99 }) |epoch| {
+        const local = cache.get(&zone, epoch);
+        try std.testing.expectEqualDeep(zone.local(epoch, 0), local);
+        try std.testing.expectEqual(@as(u8, if (epoch < 100) 0 else 1), local.hour);
+    }
+    try std.testing.expectEqual(@as(usize, 5), cache.conversions);
 }

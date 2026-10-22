@@ -16,11 +16,13 @@ const Op = union(enum) { literal: []const u8, flag: u8 };
 pub const Pattern = struct {
     allocator: std.mem.Allocator,
     ops: []Op,
+    needs_calendar: bool,
     pub fn compile(a: std.mem.Allocator, input: []const u8) !Pattern {
         const pattern = if (input.len == 0) t.default_pattern else input;
         var ops: std.ArrayList(Op) = .empty;
         errdefer ops.deinit(a);
         var i: usize = 0;
+        var needs_calendar = false;
         while (i < pattern.len) {
             const start = i;
             while (i < pattern.len and pattern[i] != '%') : (i += 1) {}
@@ -29,26 +31,27 @@ pub const Pattern = struct {
             i += 1;
             if (i == pattern.len or std.mem.indexOfScalar(u8, "%YmdHMSeftPlLnvs g#!^$", pattern[i]) == null or pattern[i] == ' ') return error.UnsupportedPattern;
             try ops.append(a, .{ .flag = pattern[i] });
+            if (std.mem.indexOfScalar(u8, "YmdHMS", pattern[i]) != null) needs_calendar = true;
             i += 1;
         }
-        return .{ .allocator = a, .ops = try ops.toOwnedSlice(a) };
+        return .{ .allocator = a, .ops = try ops.toOwnedSlice(a), .needs_calendar = needs_calendar };
     }
     pub fn deinit(p: *Pattern) void {
         p.allocator.free(p.ops);
     }
-    pub fn render(p: Pattern, w: *std.Io.Writer, record: Record, cfg: t.Config, local: time.Calendar, pid: u32, color: bool) !void {
+    pub fn render(p: Pattern, w: *std.Io.Writer, record: Record, cfg: t.Config, local: ?time.Calendar, pid: u32, color: bool) !void {
         for (p.ops) |op| switch (op) {
             .literal => |bytes| try w.writeAll(bytes),
             .flag => |flag| switch (flag) {
                 '%' => try w.writeByte('%'),
-                'Y' => try writeYear(w, local.year),
-                'm' => try w.print("{d:0>2}", .{local.month}),
-                'd' => try w.print("{d:0>2}", .{local.day}),
-                'H' => try w.print("{d:0>2}", .{local.hour}),
-                'M' => try w.print("{d:0>2}", .{local.minute}),
-                'S' => try w.print("{d:0>2}", .{local.second}),
-                'e' => try w.print("{d:0>3}", .{local.microsecond / 1000}),
-                'f' => try w.print("{d:0>6}", .{local.microsecond}),
+                'Y' => try writeYear(w, local.?.year),
+                'm' => try w.print("{d:0>2}", .{local.?.month}),
+                'd' => try w.print("{d:0>2}", .{local.?.day}),
+                'H' => try w.print("{d:0>2}", .{local.?.hour}),
+                'M' => try w.print("{d:0>2}", .{local.?.minute}),
+                'S' => try w.print("{d:0>2}", .{local.?.second}),
+                'e' => try w.print("{d:0>3}", .{record.micros / 1000}),
+                'f' => try w.print("{d:0>6}", .{record.micros}),
                 't' => try w.print("{d:0>2}", .{record.tid}),
                 'P' => try w.print("{d}", .{pid}),
                 'l' => try w.writeAll(record.level.text()),
@@ -120,7 +123,7 @@ fn tags(message: []const u8) Tags {
 pub fn json(w: *std.Io.Writer, r: Record, cfg: t.Config, local: time.Calendar, pid: u32) !void {
     try w.writeAll("{\"ts\":\"");
     try writeYear(w, local.year);
-    try w.print("-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}\"", .{ local.month, local.day, local.hour, local.minute, local.second, local.microsecond });
+    try w.print("-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}\"", .{ local.month, local.day, local.hour, local.minute, local.second, r.micros });
     try field(w, "level", r.level.json());
     try field(w, "logger", cfg.logger_name);
     try field(w, "service", cfg.service);
@@ -177,4 +180,63 @@ test "all supported flags, file colors and invalid UTF-8 JSON" {
     try std.testing.expectEqual(@as(usize, 14), parsed.value.object.count());
     for ([_][]const u8{ "%", "%q", "%-8v", "%+" }) |invalid_pattern| try std.testing.expectError(error.UnsupportedPattern, Pattern.compile(std.testing.allocator, invalid_pattern));
     for ([_][]const u8{ "plain", "[:action]", "[component:]", "[a::b]", "[a b:c]" }) |message| try std.testing.expectEqualStrings("", tags(message).component);
+}
+
+test "calendar requirements follow parsed flags and fractional time needs no calendar" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "%v", "literal YmdHMS", "%%Y", "%e", "%f", "%t %P %l %L %n %s %g %# %! %^%v%$" }) |input| {
+        var p = try Pattern.compile(a, input);
+        defer p.deinit();
+        try std.testing.expect(!p.needs_calendar);
+    }
+    for ([_][]const u8{ "", t.default_pattern, "%Y", "%m", "%d", "%H", "%M", "%S", "%%Y %S" }) |input| {
+        var p = try Pattern.compile(a, input);
+        defer p.deinit();
+        try std.testing.expect(p.needs_calendar);
+    }
+    var p = try Pattern.compile(a, "%%Y %e %f %v");
+    defer p.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var r: Record = .{ .level = .info, .seconds = 0, .micros = 1, .tid = 0, .source = @src(), .message = "payload", .runtime = true, .important = false };
+    try p.render(&out.writer, r, .{}, null, 42, false);
+    try std.testing.expectEqualStrings("%Y 000 000001 payload\n", out.written());
+    out.writer.end = 0;
+    r.micros = 999999;
+    try p.render(&out.writer, r, .{}, null, 42, false);
+    try std.testing.expectEqualStrings("%Y 999 999999 payload\n", out.written());
+}
+
+test "cached calendars preserve default, all flags and JSON bytes across timestamp order" {
+    const a = std.testing.allocator;
+    const zone: time.Zone = .{ .allocator = a, .future = try time.Posix.parse("EST5EDT,M3.2.0,M11.1.0") };
+    var cache: time.CalendarCache = .{};
+    var cached: std.Io.Writer.Allocating = .init(a);
+    defer cached.deinit();
+    var direct: std.Io.Writer.Allocating = .init(a);
+    defer direct.deinit();
+    for ([_][]const u8{ t.default_pattern, "%% %Y-%m-%d %H:%M:%S %e %f %t %P %l %L %n %s %g %# %! %^%v%$" }) |input| {
+        var p = try Pattern.compile(a, input);
+        defer p.deinit();
+        for ([_]i64{ 0, 0, -1, 86399, 86400, 100, 101, 100, 2530767600 }) |seconds| {
+            for ([_]u32{ 0, 1, 123456, 999999 }) |micros| {
+                const r: Record = .{ .level = .warn, .seconds = seconds, .micros = micros, .tid = 7, .source = @src(), .message = "[cache:check] payload", .runtime = true, .important = true };
+                const local = cache.get(&zone, seconds);
+                cached.writer.end = 0;
+                direct.writer.end = 0;
+                try p.render(&cached.writer, r, .{}, local, 42, true);
+                try p.render(&direct.writer, r, .{}, zone.local(seconds, micros), 42, true);
+                try std.testing.expectEqualStrings(direct.written(), cached.written());
+                cached.writer.end = 0;
+                direct.writer.end = 0;
+                try json(&cached.writer, r, .{}, local, 42);
+                try json(&direct.writer, r, .{}, zone.local(seconds, micros), 42);
+                try std.testing.expectEqualStrings(direct.written(), cached.written());
+            }
+        }
+    }
+    const r: Record = .{ .level = .info, .seconds = 0, .micros = 123456, .tid = 0, .source = @src(), .message = "", .runtime = false, .important = true };
+    cached.writer.end = 0;
+    try json(&cached.writer, r, .{}, time.calendar(0, 0, 0), 42);
+    try std.testing.expect(std.mem.startsWith(u8, cached.written(), "{\"ts\":\"1970-01-01T00:00:00.123456\""));
 }

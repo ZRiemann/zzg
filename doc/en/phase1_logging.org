@@ -102,3 +102,19 @@ commit. zeta_forge's adapter acceptance does not imply a Forge version bump or
 release. No commit/push, full workspace build, long soak, sanitizer or other
 platform acceptance is implied. Subsequent optimization must preserve these
 contracts and compare repeatable benchmarks before increasing complexity.
+
+* Calendar formatting optimization (2026-10-22)
+
+This optimizes the existing logging path without renumbering Stages 1.1-1.4.
+Owner: zzg, with no new cross-repository prerequisite. Compiled patterns record
+calendar requirements; actual output routes trigger lazy conversion, sharing
+one most-recent-UTC-second calendar cache per Runtime. Fractions remain per
+record. Timezone snapshots, async record timestamps, output bytes and public
+APIs are preserved. Formatted-time caching, specialized numeric output and
+arbitrary fragment caching are outside this delivery.
+
+Acceptance covers deterministic conversion counts, DST/backward/out-of-order
+timestamps, synchronous producers and queued async records, existing
+Debug/ReleaseFast integration suites, and seven paired ReleaseFast comparisons
+using the same benchmark source. See the [[file:verification.org][validation record]] for results and
+status; actual delivery version remains unset.

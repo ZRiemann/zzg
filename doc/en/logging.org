@@ -129,6 +129,22 @@ support fixed offsets and northern/southern DST. DST strings must provide start
 and end rules. Colon-prefixed file names are accepted. Zone data is not reloaded
 at runtime; invalid or unavailable zone data fails initialization.
 
+Compiled patterns require a calendar only for =%Y/%m/%d/%H/%M/%S=.
+=%e/%f= use the current record's fractional timestamp directly; =%%Y= is a
+literal. Runtime resolves a calendar only when a destination receiving the
+current record needs it. JSONL always needs a calendar, but enabling important
+JSONL does not force conversion for a =%v= record routed only to ordinary
+outputs. Initialization still loads and validates the timezone for all patterns.
+
+Each Runtime caches the most recently used UTC second and its local calendar,
+shared by all outputs. Consecutive records in that second reuse conversion;
+any different second, including backward or out-of-order timestamps, refreshes
+the cache. Async output uses the producer's recorded time, not consumption time.
+Fractions always come from the current record, preserving microsecond precision.
+The cache uses existing output serialization, without additional locks, threads
+or hot-path heap allocation. Formatted time text is not cached, and caches are
+not shared across Runtime instances or timezones.
+
 Ordinary records pass runtime =level= before routing to runtime outputs and to
 the important file at its own threshold. Explicit =important()= has info
 severity: runtime outputs still respect runtime level; enabled important output

@@ -5,6 +5,17 @@
 
 * Releases
 
+** v0.1.1 - 2026-10-22T03:31:11Z
+:PROPERTIES:
+:CUSTOM_ID: v0.1.1
+:END:
+
+- Cache calendar conversion per runtime second and skip it when active output
+  patterns do not require calendar fields, preserving fractional timestamps.
+- Extend the benchmark to compare output formats and timezone snapshots; record
+  the comparison methodology and results in the bilingual verification docs.
+- Tests and builds were not run for this commit; no push or release was performed.
+
 ** v0.1.0 - 2026-10-21T12:44:20Z
 :PROPERTIES:
 :CUSTOM_ID: v0.1.0

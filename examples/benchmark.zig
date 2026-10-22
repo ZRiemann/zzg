@@ -52,10 +52,13 @@ const Payload = struct {
     }
 };
 const Mode = enum { sync, async, pressure, filtered, long, mixed };
+const Format = enum { payload, default, jsonl };
 const Settings = struct {
     mode: Mode,
     threads: usize,
     records: usize = 20000,
+    format: Format = .payload,
+    tz: []const u8 = "UTC0",
 
     fn parse(args: []const [:0]const u8) !Settings {
         if (args.len < 3 or !std.mem.eql(u8, args[1], "--run")) return error.InvalidArguments;
@@ -63,16 +66,25 @@ const Settings = struct {
         var result: Settings = .{ .mode = mode, .threads = if (mode == .pressure) 4 else 1 };
         var seen_threads = false;
         var seen_records = false;
+        var seen_format = false;
+        var seen_tz = false;
         var i: usize = 3;
         while (i < args.len) : (i += 2) {
             if (i + 1 == args.len) return error.MissingValue;
-            const value = std.fmt.parseInt(usize, args[i + 1], 10) catch return error.InvalidNumber;
+            const value = args[i + 1];
             if (std.mem.eql(u8, args[i], "--threads") and !seen_threads) {
-                result.threads = value;
+                result.threads = std.fmt.parseInt(usize, value, 10) catch return error.InvalidNumber;
                 seen_threads = true;
             } else if (std.mem.eql(u8, args[i], "--records") and !seen_records) {
-                result.records = value;
+                result.records = std.fmt.parseInt(usize, value, 10) catch return error.InvalidNumber;
                 seen_records = true;
+            } else if (std.mem.eql(u8, args[i], "--format") and !seen_format) {
+                result.format = std.meta.stringToEnum(Format, value) orelse return error.UnknownFormat;
+                seen_format = true;
+            } else if (std.mem.eql(u8, args[i], "--tz") and !seen_tz) {
+                for (value) |byte| if (std.ascii.isWhitespace(byte) or std.ascii.isControl(byte)) return error.InvalidTimezoneArgument;
+                result.tz = value;
+                seen_tz = true;
             } else return error.InvalidArguments;
         }
         switch (result.threads) {
@@ -93,7 +105,9 @@ const Settings = struct {
 };
 fn usage() void {
     std.debug.print("Usage: benchmark --run sync|async|pressure|filtered|long|mixed [--threads 1|2|4|8] [--records N]\n" ++
+        "                 [--format payload|default|jsonl] [--tz STRING]\n" ++
         "Defaults: 20,000 total calls per measured round; one producer (pressure: four).\n" ++
+        "Format defaults to payload (%v); timezone defaults to UTC0. JSONL uses important-only output.\n" ++
         "Records must divide evenly across producers; mixed needs multiples of 10 per producer.\n" ++
         "Example: benchmark --run filtered --threads 8 --records 200000\n", .{});
 }
@@ -207,17 +221,17 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(path);
     var env = std.process.Environ.Map.init(init.gpa);
     defer env.deinit();
-    try env.put("TZ", "UTC0");
+    try env.put("TZ", settings.tz);
     var counter: Counter = .{ .parent = init.gpa };
     const async_mode = switch (settings.mode) {
         .async, .pressure, .long => true,
         else => false,
     };
-    const guard = try z.log.init(counter.allocator(), init.io, &env, .{ .console = false, .rotating_file = true, .name = path, .rotate_on_open = false, .async = async_mode, .queue_size = if (settings.mode == .pressure) 2 else 64, .flush_interval_sec = 0, .flush_level = .off, .pattern = "%v", .level = switch (settings.mode) {
+    const guard = try z.log.init(counter.allocator(), init.io, &env, .{ .console = false, .rotating_file = settings.format != .jsonl, .name = path, .rotate_on_open = false, .async = async_mode, .queue_size = if (settings.mode == .pressure) 2 else 64, .flush_interval_sec = 0, .flush_level = .off, .pattern = if (settings.format == .payload) "%v" else (z.log.Config{}).pattern, .level = switch (settings.mode) {
         .filtered => .off,
         .mixed => .info,
         else => .trace,
-    }, .max_size = 256 });
+    }, .max_size = 256, .important = .{ .enabled = settings.format == .jsonl, .name = path, .level = .info, .format = .jsonl, .rotate_on_open = false, .max_size = 256 } });
     defer guard.deinit();
     const samples = try init.gpa.alloc(u64, settings.records);
     defer init.gpa.free(samples);
@@ -238,5 +252,5 @@ pub fn main(init: std.process.Init) !void {
     const expected = settings.eligible(1000) + 2 * settings.eligible(settings.records);
     if (stats.accepted + stats.dropped != expected or stats.processed != stats.accepted or stats.failures != 0 or counter.live.load(.monotonic) != 0) return error.BenchmarkCorrectnessFailure;
     std.mem.sort(u64, samples, {}, std.sort.asc(u64));
-    std.debug.print("mode={s} threads={d} records={d} batch_calls_per_sec={d:.0} batch_drain_per_sec={d:.0} submit_per_sec={d:.0} drain_per_sec={d:.0} p50_ns={d} p99_ns={d} drain_ns={d} hot_allocations={d} batch_hot_allocations={d} peak_allocated_bytes={d} queue_high_water={d} accepted={d} processed={d} dropped={d} batch_accepted={d} batch_dropped={d} latency_accepted={d} latency_dropped={d}\n", .{ @tagName(settings.mode), settings.threads, settings.records, rate(settings.records, batch.submit_ns), rate(@intCast(batch.accepted), batch.drain_ns), rate(settings.records, latency.submit_ns), rate(@intCast(latency.accepted), latency.drain_ns), samples[settings.records / 2], samples[settings.records * 99 / 100], latency.drain_ns, latency.allocations, batch.allocations, counter.peak.load(.monotonic), stats.queue_high_water, stats.accepted, stats.processed, stats.dropped, batch.accepted, batch.dropped, latency.accepted, latency.dropped });
+    std.debug.print("mode={s} format={s} tz={s} threads={d} records={d} batch_calls_per_sec={d:.0} batch_drain_per_sec={d:.0} submit_per_sec={d:.0} drain_per_sec={d:.0} p50_ns={d} p99_ns={d} drain_ns={d} hot_allocations={d} batch_hot_allocations={d} peak_allocated_bytes={d} queue_high_water={d} accepted={d} processed={d} dropped={d} batch_accepted={d} batch_dropped={d} latency_accepted={d} latency_dropped={d}\n", .{ @tagName(settings.mode), @tagName(settings.format), settings.tz, settings.threads, settings.records, rate(settings.records, batch.submit_ns), rate(@intCast(batch.accepted), batch.drain_ns), rate(settings.records, latency.submit_ns), rate(@intCast(latency.accepted), latency.drain_ns), samples[settings.records / 2], samples[settings.records * 99 / 100], latency.drain_ns, latency.allocations, batch.allocations, counter.peak.load(.monotonic), stats.queue_high_water, stats.accepted, stats.processed, stats.dropped, batch.accepted, batch.dropped, latency.accepted, latency.dropped });
 }

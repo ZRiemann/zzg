@@ -77,6 +77,8 @@ scenarios assume the default trace compile-time cutoff.
 ./zbuild.py run benchmark -- --run async
 ./zbuild.py run benchmark -- --run pressure
 ./zbuild.py run benchmark -- --run long
+./zbuild.py run benchmark -- --run sync --format default --tz CST-8
+./zbuild.py run benchmark -- --run async --format jsonl --tz EST5EDT,M3.2.0,M11.1.0
 #+end_src
 
 Each process creates all producers before warming up 1,000 total calls. It then
@@ -88,6 +90,15 @@ warm up on their own threads, wait at a shared start barrier, and remain alive
 across rounds. Thread creation, warm-up and sample allocation are not timed;
 round start/completion wake-up overhead is included. Short runs may be dominated
 by this overhead.
+
+=--format payload|default|jsonl= selects message-only =%v= (the default), the
+standard text pattern, or important-only JSONL receiving info records. JSONL
+disables ordinary outputs; normal level filtering and count conservation still
+apply. =--tz STRING= selects the initialization timezone snapshot and defaults
+to =UTC0=. Empty STRING means UTC; whitespace/control characters are rejected
+so the machine-readable result remains one line. Other timezone validation is
+the same as the logger's. Results include =format= and =tz= alongside existing
+metrics; old command lines retain their previous output configuration.
 
 #+begin_src sh
 ./zbuild.py run benchmark -- --help
@@ -138,3 +149,24 @@ eligible attempts, even when admission fails. Overflow summaries are excluded
 from data counts. Do not interpret increased attempted-call throughput as
 increased file-output throughput; compare accepted rates together with drop counts.
 Historical blocking-baseline measurements above retain their historical meaning.
+
+* Calendar optimization comparison (2026-10-22)
+
+The calendar comparison uses payload/default/jsonl, =UTC0= / =CST-8= /
+=EST5EDT,M3.2.0,M11.1.0=, sync/async and 1/8 producers: 36 conditions.
+Filtered/mixed at 1/8 producers, pressure/4 and long/1 add six regressions.
+Each condition runs seven pairs at 200,000 calls per measured round with
+physical-core affinity 0-7. Keep the same extended harness in both snapshots.
+For async, compare =batch_drain_per_sec= alongside accepted/dropped counts;
+caller latency includes both accepted calls and rejected full-queue submissions.
+
+Local reproducibility artifacts live under =build/calendar-comparison/=:
+=baseline-manifest.json= records the original checkout, while the shared-harness
+hash records its explicit benchmark-only replacement. =run_comparison.py= runs
+the primary pairs against =baseline-benchmark= and =optimized-benchmark=.
+=results.json= retains every run, binary/source hashes and inclusive quartiles.
+Threshold repeats and large-queue/single-core controls are separate artifacts;
+their output configuration differs and must not replace the primary results.
+The production benchmark still uses capacity 64 (pressure: 2).
+See [[file:doc/en/verification.org][validation evidence]] / [[file:doc/zh-CN/verification.org][验证记录]] for the accepted throughput gains and
+the measured single-producer async tail-latency tradeoff.

@@ -198,3 +198,135 @@ blocking/no-loss assumptions. Zig 0.17.0, Linux x86_64.
   before/after performance comparison or sustained-load acceptance.
 - No full library delivery build, application/live trading run, sanitizer,
   long soak, dependency upgrade, commit or deployment was performed.
+
+* Lazy calendar conversion and second-cache validation (2026-10-22)
+
+Status: accepted awaiting versioned delivery; actual version unset. Acceptance
+includes the quantified single-producer async tail-latency tradeoff below;
+it does not assert improvement in every metric.
+
+** Correctness and compatibility
+
+- Exact Zig 0.17.0 on Linux x86_64: final Debug/ReleaseFast =check/test= passed,
+  including independent consumers, failure isolation, allocation failures,
+  periodic flushing and shutdown races.
+- Eight new deterministic tests cover pattern requirements, fractional-only
+  formatting, epoch zero, negative time, day rollover, backward/out-of-order
+  timestamps, fixed offsets, TZif transitions, future northern/southern DST,
+  all routes across 40 output configurations, synchronous producers, gated
+  async backlog and overflow reports. No requirement means zero conversions;
+  consecutive same-second records and multiple outputs share one conversion.
+  Conversion accounting exists only in tests; its production field is void,
+  with no public Stats field or production counter operation.
+- Debug warn and ReleaseFast release-only off static-cutoff checks passed.
+- Both profiles passed 100 benchmark smokes: 72 format/timezone/2-or-4-producer
+  combinations, 20 rejected invalid arguments, and 8 legacy-default modes.
+  Short messages allocate no logger heap storage during measurement; shutdown
+  returns logger allocator live bytes to zero.
+- Fixed-record probes built separately from baseline and optimized sources
+  cover four zones, default and time-free patterns, all flags, color and JSONL,
+  DST boundaries, backward time, negative years and five-digit years. Each
+  emitted 320,936 identical bytes, SHA256
+  =cdccb56d27b646c288eec129e1481a2e130730bd8d79cac2309d3d37a789e23c=.
+- The ReleaseFast benchmark ELF has no interpreter or dynamic section; libc
+  was not introduced.
+
+** Paired method and primary results
+
+The baseline snapshots the actual clean checkout before runtime edits, HEAD
+=4f854a2e33b95deb38e4d6261e15f57d86ea472b=. Its original manifest retains
+pre-change hashes; only the benchmark source was then replaced by the identical
+extended harness used with the optimized runtime. Both binaries use the exact
+toolchain, ReleaseFast and physical-core affinity 0-7. Each condition has seven
+pairs with alternating/reversed order, 1,000 warm-up calls and separate batch
+and latency rounds of 200,000 calls. Measurement semantics follow the
+[[file:../../BUILD.org][build guide]]; flushing excludes fsync. This is neither a spdlog comparison
+nor a latency SLA.
+
+The primary matrix is three formats × UTC0/CST-8/POSIX DST × sync/async × 1/8
+producers: 36 conditions. Adding filtered/mixed at 1/8, pressure/4 and long/1
+gives 42 conditions and 588 process runs. Every run processed all accepted data;
+per-round accounting and allocation checks passed. Short-message measurement
+rounds made zero logger heap allocations.
+
+UTC0 results follow. Rates are million records/s, median [Q1, Q3] using inclusive
+quartiles. Sync uses attempted call throughput (no drops here); async uses
+accepted throughput including drain. p99 is the median from the separate
+latency round. Raw JSON includes every round and all metric quartiles.
+
+| Format | Mode | Producers | Baseline rate | Optimized rate | Ratio | Baseline p99 ns | Optimized p99 ns |
+|--------+------+--------+----------+----------+------+-------------+-------------|
+| payload | sync | 1 | 9.509 [9.461, 9.625] | 11.910 [11.886, 12.123] | 1.253 | 163 | 142 |
+| payload | sync | 8 | 3.081 [2.662, 3.091] | 3.311 [3.298, 3.333] | 1.075 | 14581 | 13263 |
+| payload | async | 1 | 2.327 [2.285, 2.361] | 2.517 [2.493, 2.536] | 1.082 | 893 | 1083 |
+| payload | async | 8 | 0.200 [0.197, 0.212] | 0.311 [0.284, 0.319] | 1.557 | 14147 | 13473 |
+| default | sync | 1 | 5.418 [5.372, 5.455] | 5.880 [5.795, 5.898] | 1.085 | 315 | 306 |
+| default | sync | 8 | 1.995 [1.861, 2.034] | 2.121 [1.873, 2.175] | 1.063 | 21361 | 20374 |
+| default | async | 1 | 1.908 [1.878, 1.947] | 2.388 [2.315, 2.468] | 1.252 | 710 | 696 |
+| default | async | 8 | 0.275 [0.240, 0.309] | 0.356 [0.312, 0.378] | 1.296 | 13193 | 13309 |
+| jsonl | sync | 1 | 2.429 [2.354, 2.476] | 2.698 [2.669, 2.741] | 1.111 | 1983 | 2008 |
+| jsonl | sync | 8 | 1.324 [1.293, 1.333] | 1.436 [1.370, 1.447] | 1.084 | 45696 | 41674 |
+| jsonl | async | 1 | 1.167 [1.148, 1.191] | 1.664 [1.616, 1.701] | 1.426 | 689 | 628 |
+| jsonl | async | 8 | 0.440 [0.288, 0.624] | 0.691 [0.653, 0.736] | 1.572 | 12175 | 12070 |
+
+Ranges across all three zones and 1/8 producers follow; p99 ratios above one
+mean increased tail latency.
+
+| Format | Mode | Throughput ratio range | p99 ratio range |
+|--------+------+--------------+--------------|
+| payload | sync | 1.072-2.072 | 0.529-0.910 |
+| payload | async | 1.082-1.557 | 0.952-1.445 |
+| default | sync | 1.063-1.515 | 0.673-0.971 |
+| default | async | 1.148-1.732 | 0.980-1.067 |
+| jsonl | sync | 1.067-1.304 | 0.616-1.013 |
+| jsonl | async | 1.222-1.632 | 0.911-1.048 |
+
+** Threshold investigation and known tradeoff
+
+Initial async/1/payload p99 rose by more than 10% in all three zones, alongside
+more accepted records and fewer drops. Seven further pairs for these cases and
+filtered/8 (56 runs), using the same capacity-64 binaries, reproduced the async
+increase. Higher attempted throughput or fewer drops is not latency improvement.
+
+Artifact-only harness copies then changed ordinary async queue capacity to
+262,144 in both snapshots; production code and defaults remain unchanged.
+Seven pairs per zone (42 runs) accepted and processed all 200,000 records per
+round with no drops. Another 42 runs used the same large-queue binaries limited
+to CPU 0. These diagnostic controls neither replace nor enter the primary
+capacity-64 results.
+
+| Timezone | Repeat rate ratio | Repeat p99 ratio | Lossless rate ratio | Lossless p99 ratio | One-core p99 ratio |
+|--------+--------------+--------------+----------------+----------------+----------------|
+| UTC0 | 1.097 | 1.214 | 1.068 | 1.024 | 1.029 |
+| CST-8 | 1.095 | 1.187 | 1.066 | 1.022 | 1.025 |
+| EST5EDT,M3.2.0,M11.1.0 | 1.377 | 1.466 | 1.303 | 1.104 | 1.076 |
+
+Lossless UTC/fixed-offset p99 increases fell to about 2%, while DST retained
++10.4% (2544 [2519, 2638] ns → 2809 [2790.5, 2870] ns). One-core increases
+were 2.5%-7.6%, but accepted throughput ratios were only 0.913-0.988: these
+controls also do not improve every metric. The evidence shows sensitivity to
+drop composition and concurrent scheduling. Increased queue interaction with a
+faster consumer is a possible mechanism, not a profiler-established single
+cause. Single-producer async tail regression remains a known tradeoff; this
+optimization promises no tail-latency SLA and does not change the queue protocol.
+
+Filtered/8 initially changed p99 from 17 to 21 ns; the independent repeat was
+17 to 16 ns, rate ratio 0.984. Disassembly confirms the same filtering-entry
+instruction sequence and the same 128-byte filter bitmap address separated
+from gate. The initial alert did not reproduce; nanosecond variation is not
+attributed to the calendar path.
+
+** Artifacts and boundaries
+
+=build/calendar-comparison/= contains =baseline-manifest.json=, source snapshot,
+paired binaries, =run_comparison.py=, =results.json=, check/test logs, 100 smoke
+records and byte-comparison probes. =review-repeat/=, =lossless/= and
+=lossless-single-cpu/= retain independent repeat and diagnostic results.
+Results include source/binary hashes, affinity, p50/p99, rate quartiles,
+accepted/processed/dropped and allocation data. Original data is preserved;
+repeats never overwrite it. All are local reproducible artifacts, not committed
+source deliverables.
+
+No full workspace build, sanitizer, long soak, other-platform or application
+acceptance ran. Time-text caching and timezone reload are not implemented.
+No third-party/Forge files, version, commit or push were changed.
